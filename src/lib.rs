@@ -12,6 +12,8 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::RngCore;
 
+pub mod wallet_policy;
+
 /// Generate a random 32-byte challenge as hex string (64 chars).
 pub fn generate_challenge() -> String {
     let mut bytes = [0u8; 32];

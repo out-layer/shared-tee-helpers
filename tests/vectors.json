@@ -1,0 +1,189 @@
+[
+  {
+    "name": "payment_check_capability_allow",
+    "op": { "kind": "payment_check", "amount": "5", "token": "nep141:usdc.near" },
+    "policy": {
+      "rules": {
+        "transaction_types": ["payment_check"],
+        "limits": { "per_transaction": { "nep141:usdc.near": "10" } }
+      },
+      "capabilities": { "payment_check": { "allowed": true } }
+    },
+    "now_unix": 0,
+    "request_hash": "d25a695165be5ff1ccf7dad103c4128b812a0abc4aeca4668bd8404c4de9f5ce",
+    "bind_mode": "trusted",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "cross_chain_withdraw_trusted_allow",
+    "op": { "kind": "cross_chain_withdraw", "to": "0xRecipient", "amount": "5", "token": "nep141:usdc.near", "chain": "ethereum" },
+    "policy": {
+      "rules": {
+        "transaction_types": ["cross_chain_withdraw"],
+        "addresses": { "mode": "whitelist", "list": ["0xRecipient"] },
+        "limits": { "per_transaction": { "nep141:usdc.near": "10" } }
+      }
+    },
+    "now_unix": 0,
+    "request_hash": "7b5851c3d6b2eabab311ebbc98318ba67b2f95c2d2abd19c9f5dfdfb877847ae",
+    "bind_mode": "trusted",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "transfer_stateless_allow",
+    "op": { "kind": "transfer", "to": "alice.near", "amount": "1000000000000000000000000" },
+    "policy": {
+      "rules": {
+        "transaction_types": ["transfer"],
+        "limits": { "per_transaction": { "native": "2000000000000000000000000" } }
+      }
+    },
+    "now_unix": 0,
+    "request_hash": "53bcefe7c34c56b834624296b160cb3f4c0f880e91b964c4f6f7f593e45aac97",
+    "bind_mode": "built",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "call_stateless_allow",
+    "op": {
+      "kind": "call",
+      "to": "usdc.near",
+      "method": "ft_transfer",
+      "args_base64": "eyJyZWNlaXZlcl9pZCI6ImJvYi5uZWFyIiwiYW1vdW50IjoiMTAwMDAwMCJ9",
+      "gas": "30000000000000",
+      "deposit": "1"
+    },
+    "policy": { "rules": { "transaction_types": ["call"] } },
+    "now_unix": 0,
+    "request_hash": "9d6b301f8b6cb503dd05b83ec7a2a6731287a8c54a70927432acb8bcc1cfd3cb",
+    "bind_mode": "built",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "delete_requires_approval",
+    "op": { "kind": "delete", "beneficiary": "alice.near" },
+    "policy": { "approval": { "threshold": { "required": 2 } } },
+    "now_unix": 0,
+    "request_hash": "50daadd325ef7eb79d69dc41167070f2008396ef2bed75e7c9a684b103c6f790",
+    "bind_mode": "built",
+    "decision": { "decision": "requires_approval", "threshold": 2 }
+  },
+  {
+    "name": "withdraw_full_daily_deny",
+    "op": { "kind": "withdraw", "to": "0xabc", "amount": "1000000", "token": "nep141:usdc.near" },
+    "policy": { "rules": { "limits": { "daily": { "nep141:usdc.near": "1500000" } } } },
+    "current_usage": { "daily": { "nep141:usdc.near": "1000000" } },
+    "now_unix": 0,
+    "request_hash": "1b9cd282b3d72573750a2b1a70cf8a5b8d75c24e5e3a12304749319471d060ae",
+    "bind_mode": "built",
+    "decision": {
+      "decision": "deny",
+      "reason": "Daily limit exceeded for nep141:usdc.near: 1000000 + 1000000 > 1500000"
+    }
+  },
+  {
+    "name": "raw_denied_without_capability",
+    "op": { "kind": "raw", "chain": "ethereum", "payload_hash": "deadbeef", "label": "swap on uniswap" },
+    "policy": {},
+    "now_unix": 0,
+    "request_hash": "2986ca7b028884f566bed83d2dc834d7d88f5a5757690d78727488f1148d0f02",
+    "bind_mode": "hash_pinned",
+    "decision": { "decision": "deny", "reason": "Capability for 'raw' is not enabled by policy" }
+  },
+  {
+    "name": "sign_message_bypasses_generic_approval",
+    "op": { "kind": "sign_message", "message_hash": "cafebabe", "recipient": "auth.app.near", "purpose": "auth" },
+    "policy": { "approval": { "threshold": { "required": 2 } } },
+    "now_unix": 0,
+    "request_hash": "54ea10e33ca3107a61a49a16d9f0b2eb1d0a97a5c880d7db2a6fed5fe5c11228",
+    "bind_mode": "hash_pinned",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "swap_legacy_type_alias_requires_approval",
+    "op": {
+      "kind": "swap",
+      "token_in": "nep141:wrap.near",
+      "amount_in": "1000000000000000000000000",
+      "token_out": "nep141:usdc.near",
+      "min_out": "9000000"
+    },
+    "policy": { "rules": { "transaction_types": ["intents_swap"] }, "approval": { "threshold": 3 } },
+    "now_unix": 0,
+    "request_hash": "d42db0bb0ec2dbded08845f1dea09520ab0bbc843ef78c03e0e69038380fb192",
+    "bind_mode": "trusted",
+    "decision": { "decision": "requires_approval", "threshold": 3 }
+  },
+  {
+    "name": "confidential_requires_approval",
+    "op": {
+      "kind": "confidential",
+      "flow": "withdraw",
+      "to": "alice.near",
+      "amount": "5000000",
+      "token": "nep141:usdc.near",
+      "chain": "near"
+    },
+    "policy": {
+      "capabilities": { "confidential": { "allowed": true } },
+      "approval": { "threshold": { "required": 2 } }
+    },
+    "now_unix": 0,
+    "request_hash": "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+    "bind_mode": "trusted",
+    "decision": { "decision": "requires_approval", "threshold": 2 }
+  },
+  {
+    "name": "transfer_full_under_daily_allow",
+    "op": { "kind": "transfer", "to": "alice.near", "amount": "1000000000000000000000000" },
+    "policy": { "rules": { "limits": { "daily": { "native": "2000000000000000000000000" } } } },
+    "current_usage": { "daily": { "native": "500000000000000000000000" }, "hourly_tx_count": 1 },
+    "now_unix": 0,
+    "request_hash": "53bcefe7c34c56b834624296b160cb3f4c0f880e91b964c4f6f7f593e45aac97",
+    "bind_mode": "built",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "raw_near_denied_by_chain_restriction",
+    "op": { "kind": "raw", "chain": "near", "payload_hash": "deadbeef" },
+    "policy": { "capabilities": { "raw_sign": { "allowed": true, "chains": ["ethereum"] } } },
+    "now_unix": 0,
+    "request_hash": "765fa2d6d32a064b8ab85a0769757d43ccc3351ca2e69ce9a833013aef0d11c3",
+    "bind_mode": "hash_pinned",
+    "decision": { "decision": "deny", "reason": "Raw signing is not enabled for chain 'near' by policy" }
+  },
+  {
+    "name": "auth_allowed_under_restrictive_non_frozen_policy",
+    "op": { "kind": "auth", "purpose": "bearer", "seed": "default" },
+    "policy": { "rules": { "transaction_types": ["transfer"] }, "approval": { "threshold": { "required": 2 } } },
+    "now_unix": 0,
+    "request_hash": "68dc4d7fd4e70d5ae43fb3e7050f2aa4919836de929bc9a10b6a27620094d628",
+    "bind_mode": "built",
+    "decision": { "decision": "allow" }
+  },
+  {
+    "name": "auth_blocked_when_frozen",
+    "op": { "kind": "auth", "purpose": "bearer", "seed": "default" },
+    "policy": { "frozen": true },
+    "now_unix": 0,
+    "request_hash": "68dc4d7fd4e70d5ae43fb3e7050f2aa4919836de929bc9a10b6a27620094d628",
+    "bind_mode": "built",
+    "decision": { "decision": "frozen" }
+  },
+  {
+    "name": "confidential_denied_without_capability",
+    "op": {
+      "kind": "confidential",
+      "flow": "withdraw",
+      "to": "alice.near",
+      "amount": "5000000",
+      "token": "nep141:usdc.near",
+      "chain": "near"
+    },
+    "policy": {},
+    "now_unix": 0,
+    "request_hash": "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+    "bind_mode": "trusted",
+    "decision": { "decision": "deny", "reason": "Capability for 'confidential' is not enabled by policy" }
+  }
+]
