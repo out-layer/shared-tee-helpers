@@ -566,6 +566,13 @@ pub struct Capabilities {
     /// limit.
     #[serde(default)]
     pub payment_check: Option<Capability>,
+    /// Swap (1Click) capability. Default-DENY. Swap is Trusted (the coordinator supplies
+    /// the quote/route/deposit-address artifact, unbound to the structured policy), so even
+    /// single-sig it is full coordinator-trust of the input token's balance — opt-in only.
+    /// Gating Swap ONLY via `transaction_types` left it ungated when that field was absent;
+    /// this capability closes that (default-DENY regardless of transaction_types).
+    #[serde(default)]
+    pub swap: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -910,6 +917,9 @@ fn check_capabilities(policy: &Policy, op: &Op) -> Option<Decision> {
         Op::SignMessage { .. } => (caps.and_then(|c| c.sign_message.as_ref()), true),
         // payment_check (claimable link) is a whitelist-bypass fund primitive: default-DENY.
         Op::PaymentCheck { .. } => (caps.and_then(|c| c.payment_check.as_ref()), false),
+        // swap is Trusted (coordinator-supplied artifact) → default-DENY, even when
+        // transaction_types is absent (which would otherwise leave it ungated).
+        Op::Swap { .. } => (caps.and_then(|c| c.swap.as_ref()), false),
         _ => return None,
     };
 
@@ -1045,6 +1055,28 @@ mod tests {
         assert_eq!(&nc[9..17], &0x0A0B0C0Du64.to_le_bytes());
         assert_eq!(&nc[17..25], &0x01020304u64.to_le_bytes());
         assert_eq!(&nc[25..32], &random);
+    }
+
+    #[test]
+    fn swap_is_default_deny_capability_even_without_transaction_types() {
+        // The closed hole: gating Swap only via `transaction_types` left it UNGATED when
+        // that field was absent. As a capability it is default-DENY regardless.
+        let op = Op::Swap {
+            token_in: "nep141:wrap.near".into(),
+            amount_in: "1".into(),
+            token_out: "nep141:usdc.near".into(),
+            min_out: "1".into(),
+        };
+        // No transaction_types, no capabilities → DENY (previously this allowed).
+        let bare: Policy = serde_json::from_str(r#"{"rules":{}}"#).unwrap();
+        assert!(matches!(evaluate(&bare, &op, None, 0), Decision::Deny { .. }));
+        // Even an entirely empty policy object → DENY.
+        let empty: Policy = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(matches!(evaluate(&empty, &op, None, 0), Decision::Deny { .. }));
+        // Capability enabled → Allow.
+        let ok: Policy =
+            serde_json::from_str(r#"{"capabilities":{"swap":{"allowed":true}}}"#).unwrap();
+        assert!(matches!(evaluate(&ok, &op, None, 0), Decision::Allow));
     }
 
     #[test]

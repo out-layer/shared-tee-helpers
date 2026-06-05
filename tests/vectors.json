@@ -108,11 +108,26 @@
       "token_out": "nep141:usdc.near",
       "min_out": "9000000"
     },
-    "policy": { "rules": { "transaction_types": ["intents_swap"] }, "approval": { "threshold": 3 } },
+    "policy": { "rules": { "transaction_types": ["intents_swap"] }, "approval": { "threshold": 3 }, "capabilities": { "swap": { "allowed": true } } },
     "now_unix": 0,
     "request_hash": "d42db0bb0ec2dbded08845f1dea09520ab0bbc843ef78c03e0e69038380fb192",
     "bind_mode": "trusted",
     "decision": { "decision": "requires_approval", "threshold": 3 }
+  },
+  {
+    "name": "swap_denied_without_capability",
+    "op": {
+      "kind": "swap",
+      "token_in": "nep141:wrap.near",
+      "amount_in": "1000000000000000000000000",
+      "token_out": "nep141:usdc.near",
+      "min_out": "9000000"
+    },
+    "policy": { "rules": { "transaction_types": ["swap", "intents_swap"] } },
+    "now_unix": 0,
+    "request_hash": "d42db0bb0ec2dbded08845f1dea09520ab0bbc843ef78c03e0e69038380fb192",
+    "bind_mode": "trusted",
+    "decision": { "decision": "deny", "reason": "Capability for 'swap' is not enabled by policy" }
   },
   {
     "name": "confidential_requires_approval",
