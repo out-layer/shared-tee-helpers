@@ -22,7 +22,8 @@
         "transaction_types": ["cross_chain_withdraw"],
         "addresses": { "mode": "whitelist", "list": ["0xRecipient"] },
         "limits": { "per_transaction": { "nep141:usdc.near": "10" } }
-      }
+      },
+      "capabilities": { "cross_chain_withdraw": { "allowed": true } }
     },
     "now_unix": 0,
     "request_hash": "7b5851c3d6b2eabab311ebbc98318ba67b2f95c2d2abd19c9f5dfdfb877847ae",
@@ -100,7 +101,7 @@
     "decision": { "decision": "allow" }
   },
   {
-    "name": "swap_legacy_type_alias_requires_approval",
+    "name": "swap_trusted_requires_approval_with_threshold",
     "op": {
       "kind": "swap",
       "token_in": "nep141:wrap.near",
@@ -130,7 +131,7 @@
     "decision": { "decision": "deny", "reason": "Capability for 'swap' is not enabled by policy" }
   },
   {
-    "name": "confidential_requires_approval",
+    "name": "confidential_trusted_requires_approval_with_threshold",
     "op": {
       "kind": "confidential",
       "flow": "withdraw",

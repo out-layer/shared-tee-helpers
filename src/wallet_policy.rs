@@ -99,6 +99,14 @@ pub enum Op {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chain: Option<String>,
+        /// SWAP flow only: output asset + minimum received, so a multisig-approved confidential
+        /// swap binds the output terms like Op::Swap. None (omitted from the canonical op) for
+        /// non-swap flows. The off-chain deposit address stays coordinator-supplied (same routing
+        /// tradeoff as Op::Swap).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_out: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_amount_out: Option<String>,
     },
 
     /// Cross-chain withdrawal via 1Click (swap + bridge). Trusted: the 1Click deposit
@@ -399,10 +407,19 @@ impl Op {
         }
     }
 
-    /// Whether this op participates in the generic approval-threshold trigger.
-    /// Fund-moving kinds do; `raw` and `sign_message` are governed by their own
-    /// capability flags (so auth challenges don't demand a multisig and raw isn't
-    /// double-gated).
+    /// Whether this op participates in the generic approval-threshold trigger — the fund-moving
+    /// kinds with a WIRED approved-execution path: Built (transfer/call/delete/withdraw) AND the
+    /// Trusted kinds swap/confidential/cross_chain_withdraw. For Built/HashPinned the approver
+    /// signature binds to exactly what executes (constructed from the op / pinned by hash). For
+    /// Trusted the approval is OWNER CONTROL: it gates WHETHER the op runs and binds its
+    /// policy-checked token+amount; the coordinator supplies the off-chain artifact (e.g. the
+    /// 1Click deposit address) at execution and that destination is coordinator-trusted — a
+    /// documented tradeoff (we do not defend against a compromised coordinator, the access path).
+    /// EXCLUDED: `payment_check` is Trusted + fund-moving but is NOT wired for approved-execution,
+    /// so its creation is gated by its default-DENY capability + per-transaction amount cap
+    /// instead (cap-gated, not approval-gated, even on a multisig wallet — wiring it is a future
+    /// follow-up). `raw`/`sign_message`/`auth` are non-fund or domain-separated and governed by
+    /// their own capability rules.
     fn triggers_generic_approval(&self) -> bool {
         matches!(
             self,
@@ -573,6 +590,13 @@ pub struct Capabilities {
     /// this capability closes that (default-DENY regardless of transaction_types).
     #[serde(default)]
     pub swap: Option<Capability>,
+    /// Cross-chain withdraw (1Click swap+bridge) capability. Default-DENY. The riskiest,
+    /// irreversible exit AND Trusted — so, like `swap`, it must be default-DENY regardless of
+    /// `transaction_types` (which is absent in a valid policy shape, where the type gate alone
+    /// would fall through to Allow). Pairs with the `cross_chain_withdraw` transaction type +
+    /// the `to` whitelist + amount limit.
+    #[serde(default)]
+    pub cross_chain_withdraw: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -920,6 +944,9 @@ fn check_capabilities(policy: &Policy, op: &Op) -> Option<Decision> {
         // swap is Trusted (coordinator-supplied artifact) → default-DENY, even when
         // transaction_types is absent (which would otherwise leave it ungated).
         Op::Swap { .. } => (caps.and_then(|c| c.swap.as_ref()), false),
+        // cross_chain_withdraw is Trusted AND the riskiest exit → default-DENY too, even when
+        // transaction_types is absent (the type gate alone would fall through to Allow).
+        Op::CrossChainWithdraw { .. } => (caps.and_then(|c| c.cross_chain_withdraw.as_ref()), false),
         _ => return None,
     };
 
@@ -1017,7 +1044,9 @@ mod tests {
                 to: Some("a.near".into()),
                 amount: "1".into(),
                 token: "near".into(),
-                chain: Some("near".into())
+                chain: Some("near".into()),
+                token_out: None,
+                min_amount_out: None
             }),
             BindMode::Trusted
         );
@@ -1058,6 +1087,46 @@ mod tests {
     }
 
     #[test]
+    fn trusted_kinds_trigger_generic_multisig_when_threshold_set() {
+        // Owner control: a wallet with an approval threshold requires approval for Trusted ops
+        // too (swap/confidential/cross_chain_withdraw/payment_check). The keystore signs the
+        // coordinator-supplied artifact AFTER approval; approval bounds the op's token+amount,
+        // while the off-chain destination stays coordinator-trusted (documented tradeoff).
+        let policy: Policy = serde_json::from_str(
+            r#"{"approval":{"threshold":{"required":2}},
+                "capabilities":{"swap":{"allowed":true},"confidential":{"allowed":true},
+                "cross_chain_withdraw":{"allowed":true},"payment_check":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        let ops = [
+            Op::Swap { token_in: "a".into(), amount_in: "1".into(), token_out: "b".into(), min_out: "1".into() },
+            Op::Confidential { flow: "withdraw".into(), to: Some("x".into()), amount: "1".into(), token: "near".into(), chain: Some("near".into()), token_out: None, min_amount_out: None },
+            Op::CrossChainWithdraw { to: "0x".into(), amount: "1".into(), token: "nep141:usdc.near".into(), chain: "ethereum".into() },
+        ];
+        for op in &ops {
+            assert!(op.triggers_generic_approval(), "Trusted must trigger generic approval: {:?}", op);
+            assert!(matches!(evaluate(&policy, op, None, 0), Decision::RequiresApproval { .. }), "Trusted op must require approval on a multisig wallet: {:?}", op);
+        }
+        // Without an approval threshold the same ops are allowed by their capability (no approval).
+        let no_threshold: Policy = serde_json::from_str(
+            r#"{"capabilities":{"swap":{"allowed":true},"confidential":{"allowed":true},
+                "cross_chain_withdraw":{"allowed":true},"payment_check":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        for op in &ops {
+            assert!(matches!(evaluate(&no_threshold, op, None, 0), Decision::Allow), "Trusted op without threshold should allow: {:?}", op);
+        }
+        // payment_check is Trusted + fund-moving but NOT wired for approved-execution → excluded
+        // from the threshold; gated by its capability + per-tx cap (cap-gated, not approval-gated).
+        let pc = Op::PaymentCheck { amount: "1".into(), token: "nep141:usdc.near".into() };
+        assert!(!pc.triggers_generic_approval());
+        assert!(matches!(evaluate(&policy, &pc, None, 0), Decision::Allow));
+        // Built fund-movers also trigger the threshold.
+        assert!(Op::Transfer { to: "a".into(), amount: "1".into() }.triggers_generic_approval());
+        assert!(Op::Withdraw { to: "a".into(), amount: "1".into(), token: "near".into() }.triggers_generic_approval());
+    }
+
+    #[test]
     fn swap_is_default_deny_capability_even_without_transaction_types() {
         // The closed hole: gating Swap only via `transaction_types` left it UNGATED when
         // that field was absent. As a capability it is default-DENY regardless.
@@ -1089,6 +1158,8 @@ mod tests {
         assert_eq!(op.amount(), Some("5"));
         assert_eq!(op.token(), "nep141:usdc.near");
         assert_eq!(bind_mode(&op), BindMode::Trusted);
+        // Trusted + fund-moving, but NOT wired for approved-execution → excluded from the generic
+        // threshold; gated by its default-DENY capability + per-transaction amount cap.
         assert!(!op.triggers_generic_approval());
 
         // Capability absent → default-DENY even if the type is allowed.
@@ -1128,6 +1199,8 @@ mod tests {
         assert_eq!(op.destination(), Some("0xRecipient"));
         assert_eq!(op.amount(), Some("5"));
         assert_eq!(op.token(), "nep141:usdc.near");
+        // Trusted, but participates in the generic threshold (owner control): a wallet with an
+        // approval threshold requires approval; without one it resolves via its capability.
         assert!(op.triggers_generic_approval());
 
         // A withdraw-only policy does NOT permit cross-chain (default-DENY / opt-in).
@@ -1139,14 +1212,31 @@ mod tests {
         .unwrap();
         assert!(matches!(evaluate(&withdraw_only, &op, None, 0), Decision::Deny { .. }));
 
-        // Opted-in + whitelisted destination + within per_transaction → Allow.
-        let policy: Policy = serde_json::from_str(
+        // Even with the type listed, the default-DENY capability must be opted in too.
+        let type_only: Policy = serde_json::from_str(
             r#"{"rules":{"transaction_types":["cross_chain_withdraw"],
                 "addresses":{"mode":"whitelist","list":["0xRecipient"]},
                 "limits":{"per_transaction":{"nep141:usdc.near":"10"}}}}"#,
         )
         .unwrap();
+        assert!(matches!(evaluate(&type_only, &op, None, 0), Decision::Deny { .. }));
+
+        // Opted-in (type + capability) + whitelisted destination + within per_transaction → Allow.
+        let policy: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["cross_chain_withdraw"],
+                "addresses":{"mode":"whitelist","list":["0xRecipient"]},
+                "limits":{"per_transaction":{"nep141:usdc.near":"10"}}},
+                "capabilities":{"cross_chain_withdraw":{"allowed":true}}}"#,
+        )
+        .unwrap();
         assert!(matches!(evaluate(&policy, &op, None, 0), Decision::Allow));
+
+        // The closed hole: NO transaction_types (valid shape) must STILL deny (capability gate),
+        // mirroring swap — not fall through to Allow on the riskiest exit.
+        let bare: Policy = serde_json::from_str(r#"{"rules":{}}"#).unwrap();
+        assert!(matches!(evaluate(&bare, &op, None, 0), Decision::Deny { .. }));
+        let empty: Policy = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(matches!(evaluate(&empty, &op, None, 0), Decision::Deny { .. }));
 
         // Over the per_transaction cap → Deny.
         let over = Op::CrossChainWithdraw {
@@ -1393,6 +1483,8 @@ mod tests {
             amount: "1".into(),
             token: "near".into(),
             chain: Some("near".into()),
+            token_out: None,
+            min_amount_out: None,
         };
         // No capabilities → confidential is now default-denied (like raw_sign).
         match evaluate(&Policy::default(), &op, None, 0) {
@@ -1402,6 +1494,63 @@ mod tests {
         // Explicitly enabled → allowed.
         let policy = policy_from(json!({ "capabilities": { "confidential": { "allowed": true } } }));
         assert_eq!(evaluate(&policy, &op, None, 0), Decision::Allow);
+    }
+
+    #[test]
+    fn confidential_swap_output_binds_into_hash_non_swap_unchanged() {
+        // A non-swap confidential op with the new fields = None must hash IDENTICALLY to one
+        // that omits them entirely (skip_serializing_if) → the legacy reference vectors and any
+        // already-stored op_canonical reproduce. This is the "non-swap canonical unchanged"
+        // invariant the FIX 2 acceptance requires.
+        let legacy: Op = serde_json::from_str(
+            r#"{"kind":"confidential","flow":"withdraw","to":"alice.near","amount":"5000000","token":"nep141:usdc.near","chain":"near"}"#,
+        )
+        .unwrap();
+        let explicit_none = Op::Confidential {
+            flow: "withdraw".into(),
+            to: Some("alice.near".into()),
+            amount: "5000000".into(),
+            token: "nep141:usdc.near".into(),
+            chain: Some("near".into()),
+            token_out: None,
+            min_amount_out: None,
+        };
+        assert_eq!(canonical_json(&legacy), canonical_json(&explicit_none));
+        assert_eq!(request_hash(&legacy), request_hash(&explicit_none));
+        assert_eq!(
+            request_hash(&legacy),
+            "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+            "non-swap confidential hash must match the pre-change reference vector"
+        );
+
+        // A SWAP-flow confidential op that carries token_out + min_amount_out hashes
+        // DIFFERENTLY → the output terms are now bound into what approvers sign.
+        let swap_bound = Op::Confidential {
+            flow: "swap".into(),
+            to: Some("0xdeadbeef".into()),
+            amount: "5000000".into(),
+            token: "nep141:usdc.near".into(),
+            chain: Some("near".into()),
+            token_out: Some("nep141:wrap.near".into()),
+            min_amount_out: Some("4900000".into()),
+        };
+        let swap_unbound = Op::Confidential {
+            flow: "swap".into(),
+            to: Some("0xdeadbeef".into()),
+            amount: "5000000".into(),
+            token: "nep141:usdc.near".into(),
+            chain: Some("near".into()),
+            token_out: None,
+            min_amount_out: None,
+        };
+        // Sanity: the unbound variant omits both fields from the canonical form.
+        assert!(!canonical_json(&swap_unbound).contains("token_out"));
+        assert!(!canonical_json(&swap_unbound).contains("min_amount_out"));
+        // Binding the output changes the hash (a coordinator can no longer swap the output
+        // terms after approvers signed).
+        assert!(canonical_json(&swap_bound).contains("\"token_out\":\"nep141:wrap.near\""));
+        assert!(canonical_json(&swap_bound).contains("\"min_amount_out\":\"4900000\""));
+        assert_ne!(request_hash(&swap_bound), request_hash(&swap_unbound));
     }
 
     #[test]
