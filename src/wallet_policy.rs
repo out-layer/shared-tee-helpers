@@ -706,16 +706,20 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
 
     let rules = policy.rules.as_ref();
 
-    // 2. transaction_types (STATELESS). Deployed policies may list the legacy
+    // 3. transaction_types (STATELESS). Deployed policies may list the legacy
     //    deposit-family types (`intents_deposit`/`storage_deposit`/`cross_chain_deposit`),
     //    which all collapse to `call` (plan §2c) — normalize them on the POLICY side so
     //    old policies keep matching. We do NOT alias the op the other way (that would let
     //    a generic call satisfy a deposit-only policy → coordinator-mislabel hole).
     if let Some(allowed) = rules.and_then(|r| r.transaction_types.as_ref()) {
-        let ok = op
-            .type_aliases()
-            .iter()
-            .any(|alias| allowed.iter().any(|t| normalize_policy_type(t) == *alias));
+        // sign_message is a non-fund, capability-gated signature (like auth above): the
+        // fund-tx allowlist does NOT apply. It is gated by capabilities.sign_message + the
+        // keystore's allowed_recipients allowlist, not transaction_types.
+        let ok = matches!(op, Op::SignMessage { .. })
+            || op
+                .type_aliases()
+                .iter()
+                .any(|alias| allowed.iter().any(|t| normalize_policy_type(t) == *alias));
         if !ok {
             return deny(format!(
                 "Transaction type '{}' is not allowed by policy",
@@ -724,15 +728,17 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
         }
     }
 
-    // 3. allowed_tokens (STATELESS). `["*"]` means any.
+    // 4. allowed_tokens (STATELESS). `["*"]` means any.
     if let Some(allowed) = rules.and_then(|r| r.allowed_tokens.as_ref()) {
+        // sign_message carries no fund token (op.token() == "native") — exempt it too,
+        // same rationale as the transaction_types exemption above.
         let any = allowed.iter().any(|t| t == "*");
-        if !any && !allowed.iter().any(|t| t == op.token()) {
+        if !any && !matches!(op, Op::SignMessage { .. }) && !allowed.iter().any(|t| t == op.token()) {
             return deny(format!("Token '{}' is not allowed by policy", op.token()));
         }
     }
 
-    // 4. address whitelist/blacklist (STATELESS).
+    // 5. address whitelist/blacklist (STATELESS).
     if let (Some(addresses), Some(dest)) = (rules.and_then(|r| r.addresses.as_ref()), op.destination()) {
         if !dest.is_empty() {
             match addresses.mode.as_deref().unwrap_or("whitelist") {
@@ -763,7 +769,7 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
     if let Some(limits) = rules.and_then(|r| r.limits.as_ref()) {
         let token = op.token();
 
-        // 5. per_transaction cap (STATELESS).
+        // 6. per_transaction cap (STATELESS).
         if let (Some(amt), Some(per_tx)) = (amount, limits.per_transaction.as_ref()) {
             if let Some(limit) = lookup_limit(per_tx, token) {
                 if amt > limit {
@@ -775,7 +781,7 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
             }
         }
 
-        // 6. velocity caps (STATEFUL — only when usage is supplied).
+        // 7. velocity caps (STATEFUL — only when usage is supplied).
         if let Some(usage) = usage {
             if let Some(amt) = amount {
                 for (window, configured, current) in [
@@ -827,20 +833,20 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
         }
     }
 
-    // 7. time restrictions (STATELESS — uses `now_unix`).
+    // 8. time restrictions (STATELESS — uses `now_unix`).
     if let Some(tr) = rules.and_then(|r| r.time_restrictions.as_ref()) {
         if let Some(decision) = check_time_restrictions(tr, now_unix) {
             return decision;
         }
     }
 
-    // 8. capabilities (STATELESS) — gate the non-Built primitives and decide whether
+    // 9. capabilities (STATELESS) — gate the non-Built primitives and decide whether
     // they need approval, independent of the generic threshold.
     if let Some(decision) = check_capabilities(policy, op) {
         return decision;
     }
 
-    // 9. generic multisig trigger (STATELESS) for fund-moving kinds.
+    // 10. generic multisig trigger (STATELESS) for fund-moving kinds.
     if op.triggers_generic_approval() {
         if let Some(approval) = policy.approval.as_ref() {
             let excluded = approval
@@ -998,6 +1004,27 @@ mod tests {
 
     fn policy_from(v: serde_json::Value) -> Policy {
         serde_json::from_value(v).expect("policy parse")
+    }
+
+    #[test]
+    fn sign_message_exempt_from_transaction_types_and_tokens() {
+        // sign_message is capability-gated (capabilities.sign_message + the keystore's
+        // allowed_recipients allowlist), NOT a fund transaction — the transaction_types /
+        // allowed_tokens fund-rules must NOT deny it. Regression for the masked-502 bug
+        // (a policy listing only `transfer` used to deny sign_message via transaction_types).
+        let policy = policy_from(json!({
+            "rules": { "transaction_types": ["transfer"], "allowed_tokens": ["usdc"] },
+            "capabilities": { "sign_message": { "allowed": true, "allowed_recipients": ["app.example.near"] } }
+        }));
+        let op = Op::SignMessage {
+            message_hash: "ab".into(),
+            recipient: "app.example.near".into(),
+            purpose: None,
+        };
+        assert!(
+            matches!(evaluate(&policy, &op, None, 0), Decision::Allow),
+            "sign_message must not be denied by transaction_types/allowed_tokens"
+        );
     }
 
     #[test]
