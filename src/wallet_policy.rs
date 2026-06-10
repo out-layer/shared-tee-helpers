@@ -60,6 +60,24 @@ pub enum Op {
         token: String,
     },
 
+    /// Internal Intents transfer: move a token balance from the wallet's intents
+    /// balance to ANOTHER account's intents balance, staying inside `intents.near`
+    /// (the defuse `transfer` intent), gasless via the solver relay. Built: the
+    /// keystore constructs the NEP-413 `transfer` intent message (fresh deadline)
+    /// from these fields, so the recipient CANNOT be substituted by the coordinator
+    /// (strictly stronger than the Trusted swap path). This is a fund-moving op to an
+    /// arbitrary recipient, so `to` is carried in `destination()` and it is gated by
+    /// the `to` whitelist + per-token amount limit (exactly like `Withdraw`). Distinct
+    /// from `Transfer` (native NEAR on-chain) and `Withdraw` (exits intents to a plain
+    /// on-chain account): it has its OWN `intents_transfer` type so a `transfer`/
+    /// `withdraw` policy does not implicitly permit it. (Verified against the defuse
+    /// `Intent` enum in `near/intents`.)
+    IntentsTransfer {
+        to: String,
+        amount: String,
+        token: String,
+    },
+
     /// Raw payload signing (e.g. an Ethereum tx). Hash-pinned: the op carries the
     /// payload hash; the keystore signs the supplied bytes iff sha256(bytes)==payload_hash.
     /// Internals are NOT inspected — gated entirely by the `raw_sign` capability.
@@ -275,9 +293,11 @@ pub enum BindMode {
 /// The bind mode for an op. Total function over all kinds.
 pub fn bind_mode(op: &Op) -> BindMode {
     match op {
-        Op::Transfer { .. } | Op::Call { .. } | Op::Delete { .. } | Op::Withdraw { .. } => {
-            BindMode::Built
-        }
+        Op::Transfer { .. }
+        | Op::Call { .. }
+        | Op::Delete { .. }
+        | Op::Withdraw { .. }
+        | Op::IntentsTransfer { .. } => BindMode::Built,
         Op::Raw { .. } | Op::SignMessage { .. } => BindMode::HashPinned,
         Op::Swap { .. }
         | Op::Confidential { .. }
@@ -338,6 +358,10 @@ impl Op {
             Op::Call { .. } => &["call"],
             Op::Delete { .. } => &["delete"],
             Op::Withdraw { .. } => &["withdraw", "intents_withdraw"],
+            // Internal intents transfer gets its OWN type (NOT folded into `transfer`, which
+            // is native NEAR, nor `withdraw`): a policy must explicitly list `intents_transfer`
+            // to permit it. Gated by the `to` whitelist + per-token amount limit like withdraw.
+            Op::IntentsTransfer { .. } => &["intents_transfer"],
             // Cross-chain is the riskiest exit (irreversible, leaves NEAR via a bridge),
             // so it is gated by its OWN type — NOT folded into `withdraw`/`intents_withdraw`.
             // A policy must explicitly list `cross_chain_withdraw` to permit it (default-DENY
@@ -364,6 +388,7 @@ impl Op {
         match self {
             Op::Transfer { .. } | Op::Call { .. } | Op::Delete { .. } => "native",
             Op::Withdraw { token, .. }
+            | Op::IntentsTransfer { token, .. }
             | Op::Confidential { token, .. }
             | Op::CrossChainWithdraw { token, .. }
             | Op::PaymentCheck { token, .. } => token,
@@ -378,6 +403,7 @@ impl Op {
         match self {
             Op::Transfer { amount, .. }
             | Op::Withdraw { amount, .. }
+            | Op::IntentsTransfer { amount, .. }
             | Op::Confidential { amount, .. }
             | Op::CrossChainWithdraw { amount, .. }
             | Op::PaymentCheck { amount, .. } => Some(amount),
@@ -392,6 +418,7 @@ impl Op {
         match self {
             Op::Transfer { to, .. }
             | Op::Withdraw { to, .. }
+            | Op::IntentsTransfer { to, .. }
             | Op::CrossChainWithdraw { to, .. } => Some(to),
             Op::Call { to, .. } => Some(to),
             Op::Delete { beneficiary, .. } => Some(beneficiary),
@@ -427,6 +454,7 @@ impl Op {
                 | Op::Call { .. }
                 | Op::Delete { .. }
                 | Op::Withdraw { .. }
+                | Op::IntentsTransfer { .. }
                 | Op::Swap { .. }
                 | Op::Confidential { .. }
                 | Op::CrossChainWithdraw { .. }
@@ -1151,6 +1179,35 @@ mod tests {
         // Built fund-movers also trigger the threshold.
         assert!(Op::Transfer { to: "a".into(), amount: "1".into() }.triggers_generic_approval());
         assert!(Op::Withdraw { to: "a".into(), amount: "1".into(), token: "near".into() }.triggers_generic_approval());
+        assert!(Op::IntentsTransfer { to: "a".into(), amount: "1".into(), token: "nep141:usdc.near".into() }.triggers_generic_approval());
+    }
+
+    #[test]
+    fn intents_transfer_is_built_whitelist_gated() {
+        let op = Op::IntentsTransfer {
+            to: "partner.near".into(),
+            amount: "1000".into(),
+            token: "nep141:usdc.near".into(),
+        };
+        // Built (keystore constructs the transfer intent → recipient can't be substituted).
+        assert_eq!(bind_mode(&op), BindMode::Built);
+        // Its OWN type — NOT folded into native `transfer` or `withdraw`.
+        assert_eq!(op.primary_type(), "intents_transfer");
+        assert_eq!(op.type_aliases(), &["intents_transfer"]);
+        // Accessors expose the fund-moving fields for the whitelist + per-token limit gates.
+        assert_eq!(op.token(), "nep141:usdc.near");
+        assert_eq!(op.amount(), Some("1000"));
+        assert_eq!(op.destination(), Some("partner.near"));
+        // No capability gate (catch-all `None`) → gated only by transaction_types + whitelist +
+        // amount, exactly like Withdraw. A policy that allows `intents_transfer` to a whitelisted
+        // `to` permits it; one that doesn't list the type denies it.
+        let allow: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["intents_transfer"],"addresses":{"mode":"whitelist","list":["partner.near"]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&allow, &op, None, 0), Decision::Allow));
+        let bad_to = Op::IntentsTransfer { to: "evil.near".into(), amount: "1".into(), token: "nep141:usdc.near".into() };
+        assert!(matches!(evaluate(&allow, &bad_to, None, 0), Decision::Deny { .. }));
     }
 
     #[test]
