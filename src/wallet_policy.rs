@@ -1109,7 +1109,7 @@ mod tests {
             bind_mode(&Op::CrossChainWithdraw {
                 to: "0xabc".into(),
                 amount: "1".into(),
-                token: "nep141:usdc.near".into(),
+                token: "nep141:usdt.tether-token.near".into(),
                 chain: "ethereum".into()
             }),
             BindMode::Trusted
@@ -1156,7 +1156,7 @@ mod tests {
         let ops = [
             Op::Swap { token_in: "a".into(), amount_in: "1".into(), token_out: "b".into(), min_out: "1".into() },
             Op::Confidential { flow: "withdraw".into(), to: Some("x".into()), amount: "1".into(), token: "near".into(), chain: Some("near".into()), token_out: None, min_amount_out: None },
-            Op::CrossChainWithdraw { to: "0x".into(), amount: "1".into(), token: "nep141:usdc.near".into(), chain: "ethereum".into() },
+            Op::CrossChainWithdraw { to: "0x".into(), amount: "1".into(), token: "nep141:usdt.tether-token.near".into(), chain: "ethereum".into() },
         ];
         for op in &ops {
             assert!(op.triggers_generic_approval(), "Trusted must trigger generic approval: {:?}", op);
@@ -1173,13 +1173,13 @@ mod tests {
         }
         // payment_check is Trusted + fund-moving but NOT wired for approved-execution → excluded
         // from the threshold; gated by its capability + per-tx cap (cap-gated, not approval-gated).
-        let pc = Op::PaymentCheck { amount: "1".into(), token: "nep141:usdc.near".into() };
+        let pc = Op::PaymentCheck { amount: "1".into(), token: "nep141:usdt.tether-token.near".into() };
         assert!(!pc.triggers_generic_approval());
         assert!(matches!(evaluate(&policy, &pc, None, 0), Decision::Allow));
         // Built fund-movers also trigger the threshold.
         assert!(Op::Transfer { to: "a".into(), amount: "1".into() }.triggers_generic_approval());
         assert!(Op::Withdraw { to: "a".into(), amount: "1".into(), token: "near".into() }.triggers_generic_approval());
-        assert!(Op::IntentsTransfer { to: "a".into(), amount: "1".into(), token: "nep141:usdc.near".into() }.triggers_generic_approval());
+        assert!(Op::IntentsTransfer { to: "a".into(), amount: "1".into(), token: "nep141:usdt.tether-token.near".into() }.triggers_generic_approval());
     }
 
     #[test]
@@ -1187,7 +1187,7 @@ mod tests {
         let op = Op::IntentsTransfer {
             to: "partner.near".into(),
             amount: "1000".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
         };
         // Built (keystore constructs the transfer intent → recipient can't be substituted).
         assert_eq!(bind_mode(&op), BindMode::Built);
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(op.primary_type(), "intents_transfer");
         assert_eq!(op.type_aliases(), &["intents_transfer"]);
         // Accessors expose the fund-moving fields for the whitelist + per-token limit gates.
-        assert_eq!(op.token(), "nep141:usdc.near");
+        assert_eq!(op.token(), "nep141:usdt.tether-token.near");
         assert_eq!(op.amount(), Some("1000"));
         assert_eq!(op.destination(), Some("partner.near"));
         // No capability gate (catch-all `None`) → gated only by transaction_types + whitelist +
@@ -1206,7 +1206,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(evaluate(&allow, &op, None, 0), Decision::Allow));
-        let bad_to = Op::IntentsTransfer { to: "evil.near".into(), amount: "1".into(), token: "nep141:usdc.near".into() };
+        let bad_to = Op::IntentsTransfer { to: "evil.near".into(), amount: "1".into(), token: "nep141:usdt.tether-token.near".into() };
         assert!(matches!(evaluate(&allow, &bad_to, None, 0), Decision::Deny { .. }));
     }
 
@@ -1217,7 +1217,7 @@ mod tests {
         let op = Op::Swap {
             token_in: "nep141:wrap.near".into(),
             amount_in: "1".into(),
-            token_out: "nep141:usdc.near".into(),
+            token_out: "nep141:usdt.tether-token.near".into(),
             min_out: "1".into(),
         };
         // No transaction_types, no capabilities → DENY (previously this allowed).
@@ -1236,11 +1236,11 @@ mod tests {
     fn payment_check_is_default_deny_capability_no_whitelist() {
         // Trusted by KIND, carries no destination (the claimable-link escrow defeats a
         // `to` whitelist), gated by the default-DENY `payment_check` capability + amount.
-        let op = Op::PaymentCheck { amount: "5".into(), token: "nep141:usdc.near".into() };
+        let op = Op::PaymentCheck { amount: "5".into(), token: "nep141:usdt.tether-token.near".into() };
         assert_eq!(op.type_aliases(), &["payment_check"]);
         assert_eq!(op.destination(), None);
         assert_eq!(op.amount(), Some("5"));
-        assert_eq!(op.token(), "nep141:usdc.near");
+        assert_eq!(op.token(), "nep141:usdt.tether-token.near");
         assert_eq!(bind_mode(&op), BindMode::Trusted);
         // Trusted + fund-moving, but NOT wired for approved-execution → excluded from the generic
         // threshold; gated by its default-DENY capability + per-transaction amount cap.
@@ -1256,14 +1256,14 @@ mod tests {
         // Capability enabled + within the per-token amount limit → Allow.
         let policy: Policy = serde_json::from_str(
             r#"{"rules":{"transaction_types":["payment_check"],
-                "limits":{"per_transaction":{"nep141:usdc.near":"10"}}},
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}},
                 "capabilities":{"payment_check":{"allowed":true}}}"#,
         )
         .unwrap();
         assert!(matches!(evaluate(&policy, &op, None, 0), Decision::Allow));
 
         // Over the amount limit → Deny.
-        let over = Op::PaymentCheck { amount: "50".into(), token: "nep141:usdc.near".into() };
+        let over = Op::PaymentCheck { amount: "50".into(), token: "nep141:usdt.tether-token.near".into() };
         assert!(matches!(evaluate(&policy, &over, None, 0), Decision::Deny { .. }));
     }
 
@@ -1276,13 +1276,13 @@ mod tests {
         let op = Op::CrossChainWithdraw {
             to: "0xRecipient".into(),
             amount: "5".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: "ethereum".into(),
         };
         assert_eq!(op.type_aliases(), &["cross_chain_withdraw"]);
         assert_eq!(op.destination(), Some("0xRecipient"));
         assert_eq!(op.amount(), Some("5"));
-        assert_eq!(op.token(), "nep141:usdc.near");
+        assert_eq!(op.token(), "nep141:usdt.tether-token.near");
         // Trusted, but participates in the generic threshold (owner control): a wallet with an
         // approval threshold requires approval; without one it resolves via its capability.
         assert!(op.triggers_generic_approval());
@@ -1291,7 +1291,7 @@ mod tests {
         let withdraw_only: Policy = serde_json::from_str(
             r#"{"rules":{"transaction_types":["withdraw","intents_withdraw"],
                 "addresses":{"mode":"whitelist","list":["0xRecipient"]},
-                "limits":{"per_transaction":{"nep141:usdc.near":"10"}}}}"#,
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}}}"#,
         )
         .unwrap();
         assert!(matches!(evaluate(&withdraw_only, &op, None, 0), Decision::Deny { .. }));
@@ -1300,7 +1300,7 @@ mod tests {
         let type_only: Policy = serde_json::from_str(
             r#"{"rules":{"transaction_types":["cross_chain_withdraw"],
                 "addresses":{"mode":"whitelist","list":["0xRecipient"]},
-                "limits":{"per_transaction":{"nep141:usdc.near":"10"}}}}"#,
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}}}"#,
         )
         .unwrap();
         assert!(matches!(evaluate(&type_only, &op, None, 0), Decision::Deny { .. }));
@@ -1309,7 +1309,7 @@ mod tests {
         let policy: Policy = serde_json::from_str(
             r#"{"rules":{"transaction_types":["cross_chain_withdraw"],
                 "addresses":{"mode":"whitelist","list":["0xRecipient"]},
-                "limits":{"per_transaction":{"nep141:usdc.near":"10"}}},
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}},
                 "capabilities":{"cross_chain_withdraw":{"allowed":true}}}"#,
         )
         .unwrap();
@@ -1326,7 +1326,7 @@ mod tests {
         let over = Op::CrossChainWithdraw {
             to: "0xRecipient".into(),
             amount: "50".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: "ethereum".into(),
         };
         assert!(matches!(evaluate(&policy, &over, None, 0), Decision::Deny { .. }));
@@ -1335,7 +1335,7 @@ mod tests {
         let bad_to = Op::CrossChainWithdraw {
             to: "0xAttacker".into(),
             amount: "1".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: "ethereum".into(),
         };
         assert!(matches!(evaluate(&policy, &bad_to, None, 0), Decision::Deny { .. }));
@@ -1587,14 +1587,14 @@ mod tests {
         // already-stored op_canonical reproduce. This is the "non-swap canonical unchanged"
         // invariant the FIX 2 acceptance requires.
         let legacy: Op = serde_json::from_str(
-            r#"{"kind":"confidential","flow":"withdraw","to":"alice.near","amount":"5000000","token":"nep141:usdc.near","chain":"near"}"#,
+            r#"{"kind":"confidential","flow":"withdraw","to":"alice.near","amount":"5000000","token":"nep141:usdt.tether-token.near","chain":"near"}"#,
         )
         .unwrap();
         let explicit_none = Op::Confidential {
             flow: "withdraw".into(),
             to: Some("alice.near".into()),
             amount: "5000000".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: None,
             min_amount_out: None,
@@ -1603,7 +1603,7 @@ mod tests {
         assert_eq!(request_hash(&legacy), request_hash(&explicit_none));
         assert_eq!(
             request_hash(&legacy),
-            "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+            "e5088673f947e97b88d2869b56ef1891f9abe550dca86764ef103718ca040795",
             "non-swap confidential hash must match the pre-change reference vector"
         );
 
@@ -1613,7 +1613,7 @@ mod tests {
             flow: "swap".into(),
             to: Some("0xdeadbeef".into()),
             amount: "5000000".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: Some("nep141:wrap.near".into()),
             min_amount_out: Some("4900000".into()),
@@ -1622,7 +1622,7 @@ mod tests {
             flow: "swap".into(),
             to: Some("0xdeadbeef".into()),
             amount: "5000000".into(),
-            token: "nep141:usdc.near".into(),
+            token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: None,
             min_amount_out: None,

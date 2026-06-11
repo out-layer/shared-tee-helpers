@@ -1,32 +1,32 @@
 [
   {
     "name": "payment_check_capability_allow",
-    "op": { "kind": "payment_check", "amount": "5", "token": "nep141:usdc.near" },
+    "op": { "kind": "payment_check", "amount": "5", "token": "nep141:usdt.tether-token.near" },
     "policy": {
       "rules": {
         "transaction_types": ["payment_check"],
-        "limits": { "per_transaction": { "nep141:usdc.near": "10" } }
+        "limits": { "per_transaction": { "nep141:usdt.tether-token.near": "10" } }
       },
       "capabilities": { "payment_check": { "allowed": true } }
     },
     "now_unix": 0,
-    "request_hash": "d25a695165be5ff1ccf7dad103c4128b812a0abc4aeca4668bd8404c4de9f5ce",
+    "request_hash": "3c014d3644103fd7afece3b8005e55bc8d29b8b8931fc8de78bc4de4b528d8ef",
     "bind_mode": "trusted",
     "decision": { "decision": "allow" }
   },
   {
     "name": "cross_chain_withdraw_trusted_allow",
-    "op": { "kind": "cross_chain_withdraw", "to": "0xRecipient", "amount": "5", "token": "nep141:usdc.near", "chain": "ethereum" },
+    "op": { "kind": "cross_chain_withdraw", "to": "0xRecipient", "amount": "5", "token": "nep141:usdt.tether-token.near", "chain": "ethereum" },
     "policy": {
       "rules": {
         "transaction_types": ["cross_chain_withdraw"],
         "addresses": { "mode": "whitelist", "list": ["0xRecipient"] },
-        "limits": { "per_transaction": { "nep141:usdc.near": "10" } }
+        "limits": { "per_transaction": { "nep141:usdt.tether-token.near": "10" } }
       },
       "capabilities": { "cross_chain_withdraw": { "allowed": true } }
     },
     "now_unix": 0,
-    "request_hash": "7b5851c3d6b2eabab311ebbc98318ba67b2f95c2d2abd19c9f5dfdfb877847ae",
+    "request_hash": "8c0cdd1950c160fe609f89fa5b6b12e13c6c066c678421f93a30b176a4922c65",
     "bind_mode": "trusted",
     "decision": { "decision": "allow" }
   },
@@ -48,7 +48,7 @@
     "name": "call_stateless_allow",
     "op": {
       "kind": "call",
-      "to": "usdc.near",
+      "to": "usdt.tether-token.near",
       "method": "ft_transfer",
       "args_base64": "eyJyZWNlaXZlcl9pZCI6ImJvYi5uZWFyIiwiYW1vdW50IjoiMTAwMDAwMCJ9",
       "gas": "30000000000000",
@@ -56,7 +56,7 @@
     },
     "policy": { "rules": { "transaction_types": ["call"] } },
     "now_unix": 0,
-    "request_hash": "9d6b301f8b6cb503dd05b83ec7a2a6731287a8c54a70927432acb8bcc1cfd3cb",
+    "request_hash": "6f58a56ed3826949cd653daa242445590acd0d157df318e5b5cd4aad0e47b336",
     "bind_mode": "built",
     "decision": { "decision": "allow" }
   },
@@ -71,15 +71,15 @@
   },
   {
     "name": "withdraw_full_daily_deny",
-    "op": { "kind": "withdraw", "to": "0xabc", "amount": "1000000", "token": "nep141:usdc.near" },
-    "policy": { "rules": { "limits": { "daily": { "nep141:usdc.near": "1500000" } } } },
-    "current_usage": { "daily": { "nep141:usdc.near": "1000000" } },
+    "op": { "kind": "withdraw", "to": "0xabc", "amount": "1000000", "token": "nep141:usdt.tether-token.near" },
+    "policy": { "rules": { "limits": { "daily": { "nep141:usdt.tether-token.near": "1500000" } } } },
+    "current_usage": { "daily": { "nep141:usdt.tether-token.near": "1000000" } },
     "now_unix": 0,
-    "request_hash": "1b9cd282b3d72573750a2b1a70cf8a5b8d75c24e5e3a12304749319471d060ae",
+    "request_hash": "7783a1d76de40e9a3cf0feae9fe46db91255d59557e7735462099a46418d7301",
     "bind_mode": "built",
     "decision": {
       "decision": "deny",
-      "reason": "Daily limit exceeded for nep141:usdc.near: 1000000 + 1000000 > 1500000"
+      "reason": "Daily limit exceeded for nep141:usdt.tether-token.near: 1000000 + 1000000 > 1500000"
     }
   },
   {
@@ -106,12 +106,12 @@
       "kind": "swap",
       "token_in": "nep141:wrap.near",
       "amount_in": "1000000000000000000000000",
-      "token_out": "nep141:usdc.near",
+      "token_out": "nep141:usdt.tether-token.near",
       "min_out": "9000000"
     },
     "policy": { "rules": { "transaction_types": ["intents_swap"] }, "approval": { "threshold": 3 }, "capabilities": { "swap": { "allowed": true } } },
     "now_unix": 0,
-    "request_hash": "d42db0bb0ec2dbded08845f1dea09520ab0bbc843ef78c03e0e69038380fb192",
+    "request_hash": "2a25fea72efed47b6d530a9d5e61ba475ac4c218b014a16d8e828b1e43c685ad",
     "bind_mode": "trusted",
     "decision": { "decision": "requires_approval", "threshold": 3 }
   },
@@ -121,12 +121,12 @@
       "kind": "swap",
       "token_in": "nep141:wrap.near",
       "amount_in": "1000000000000000000000000",
-      "token_out": "nep141:usdc.near",
+      "token_out": "nep141:usdt.tether-token.near",
       "min_out": "9000000"
     },
     "policy": { "rules": { "transaction_types": ["swap", "intents_swap"] } },
     "now_unix": 0,
-    "request_hash": "d42db0bb0ec2dbded08845f1dea09520ab0bbc843ef78c03e0e69038380fb192",
+    "request_hash": "2a25fea72efed47b6d530a9d5e61ba475ac4c218b014a16d8e828b1e43c685ad",
     "bind_mode": "trusted",
     "decision": { "decision": "deny", "reason": "Capability for 'swap' is not enabled by policy" }
   },
@@ -137,7 +137,7 @@
       "flow": "withdraw",
       "to": "alice.near",
       "amount": "5000000",
-      "token": "nep141:usdc.near",
+      "token": "nep141:usdt.tether-token.near",
       "chain": "near"
     },
     "policy": {
@@ -145,7 +145,7 @@
       "approval": { "threshold": { "required": 2 } }
     },
     "now_unix": 0,
-    "request_hash": "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+    "request_hash": "e5088673f947e97b88d2869b56ef1891f9abe550dca86764ef103718ca040795",
     "bind_mode": "trusted",
     "decision": { "decision": "requires_approval", "threshold": 2 }
   },
@@ -193,12 +193,12 @@
       "flow": "withdraw",
       "to": "alice.near",
       "amount": "5000000",
-      "token": "nep141:usdc.near",
+      "token": "nep141:usdt.tether-token.near",
       "chain": "near"
     },
     "policy": {},
     "now_unix": 0,
-    "request_hash": "375120fc5076525d3b3b37ca13baca8390baf9ff80d41b5bdb7afbd4d42601f8",
+    "request_hash": "e5088673f947e97b88d2869b56ef1891f9abe550dca86764ef103718ca040795",
     "bind_mode": "trusted",
     "decision": { "decision": "deny", "reason": "Capability for 'confidential' is not enabled by policy" }
   }
