@@ -625,6 +625,14 @@ pub struct Capabilities {
     /// the `to` whitelist + amount limit.
     #[serde(default)]
     pub cross_chain_withdraw: Option<Capability>,
+    /// EVM signing (EIP-712 typed-data / EIP-191 personal_sign / raw tx).
+    /// **Default-DENY under a policy** — like every other fund-moving capability,
+    /// a policy must explicitly set `allowed: true` (a wallet with NO policy is
+    /// unrestricted). See [`evm_sign_decision`] for the rationale and the
+    /// fund-authority caveat. The `raw_tx` sub-flag on the inner [`Capability`]
+    /// (default-OFF) additionally gates raw-transaction signing.
+    #[serde(default)]
+    pub evm_sign: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -643,6 +651,13 @@ pub struct Capability {
     /// under a policy → no `sign_message` recipient is permitted.
     #[serde(default)]
     pub allowed_recipients: Option<Vec<String>>,
+    /// `evm_sign` only: additionally permit signing **raw EVM transactions**
+    /// (arbitrary contract calls / native-value transfers). Default-OFF. This
+    /// is a kill-switch for arbitrary raw tx only — it does NOT contain
+    /// typed-data fund drains (EIP-3009 `transferWithAuthorization` ≈ transfer
+    /// and EIP-2612 `Permit` ≈ approve ride the base `evm_sign` capability).
+    #[serde(default)]
+    pub raw_tx: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +979,82 @@ fn check_time_restrictions(tr: &TimeRestrictions, now_unix: u64) -> Option<Decis
 
 /// Capability gate. Returns `Some(Deny)` when the capability is disabled,
 /// `Some(RequiresApproval)` when it demands approval, or `None` to continue.
+/// Decision for an EVM signing request (sign-typed-data / sign-message /
+/// raw-tx). EVM ops carry no token / amount / recipient for the engine to
+/// gate, and EVM signing intentionally has no per-op multisig flow, so they
+/// are NOT routed through [`evaluate`] / [`Op`]; this focused check covers the
+/// only things that matter: freeze + the `evm_sign` capability (+ the `raw_tx`
+/// sub-flag for raw transactions).
+///
+/// Defaults — **default-DENY when a policy is present**, consistent with every
+/// other fund-moving capability (swap / cross_chain_withdraw / payment_check /
+/// raw_sign): a wallet whose policy does NOT explicitly set
+/// `capabilities.evm_sign.allowed = true` cannot EVM-sign. A wallet with **no
+/// policy at all** is single-sig and unrestricted (the `None` arm below), so
+/// no-policy trading agents are unaffected — which is exactly why a default-ON
+/// gave nothing extra while leaving a fail-open hole for owners who DID lock
+/// their wallet down. To enable EVM signing under a policy, opt in explicitly:
+/// `"evm_sign": { "allowed": true }` (the dashboard writes this for you).
+///
+/// CAVEAT (why this must be opt-in): an EIP-712 signature is itself fund-moving
+/// (EIP-3009 `transferWithAuthorization` ≈ transfer; EIP-2612 `Permit` ≈
+/// approve), so `evm_sign` grants full authority over the EVM EOA's float.
+/// `raw_tx` (default-OFF) is a separate kill-switch for *arbitrary raw
+/// transactions*, NOT a containment boundary for typed-data drains.
+///
+/// The **stateless wallet-global gates** — `frozen` and `time_restrictions` —
+/// apply to EVM signing exactly as they do in [`evaluate`]; the time check
+/// reuses the same [`check_time_restrictions`] helper (no reimplementation).
+/// `now_unix` is the current Unix time in seconds (used only by the time gate;
+/// pass `0` in tests with no `time_restrictions`). Op-semantic checks
+/// (amount/token/recipient limits) and STATEFUL velocity/rate-limits do NOT
+/// apply: an EVM signing request carries no amount/token/recipient, and the
+/// keystore neither broadcasts nor meters EVM signatures.
+pub fn evm_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u64) -> Decision {
+    let policy = match policy {
+        // No on-chain policy → single-sig wallet, unrestricted (as today).
+        None => return Decision::Allow,
+        Some(p) => p,
+    };
+    if policy.frozen {
+        return Decision::Frozen;
+    }
+    // Owner-set time window gates EVM signing too (same stateless global gate as
+    // `evaluate` step 8) — reuse the shared helper, don't reimplement time math.
+    if let Some(tr) = policy.rules.as_ref().and_then(|r| r.time_restrictions.as_ref()) {
+        if let Some(decision) = check_time_restrictions(tr, now_unix) {
+            return decision;
+        }
+    }
+    let cap = policy.capabilities.as_ref().and_then(|c| c.evm_sign.as_ref());
+
+    // Base capability: DEFAULT-DENY under a policy (like raw_sign/swap/etc.).
+    // A policy must explicitly set `evm_sign.allowed = true` to permit signing.
+    if !cap.and_then(|c| c.allowed).unwrap_or(false) {
+        return deny(
+            "EVM signing is not enabled by policy (set capabilities.evm_sign.allowed = true)"
+                .to_string(),
+        );
+    }
+
+    // Per-op approval is not wired for EVM signing in v1. Fail closed rather
+    // than silently ignore an owner who set `requires_approval`.
+    if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
+        return deny(
+            "evm_sign.requires_approval is not supported — per-op approval for EVM signing is unavailable".to_string(),
+        );
+    }
+
+    // Raw transactions need the explicit sub-flag (default-OFF).
+    if want_raw_tx && !cap.and_then(|c| c.raw_tx).unwrap_or(false) {
+        return deny(
+            "Raw EVM transaction signing requires capabilities.evm_sign.raw_tx = true".to_string(),
+        );
+    }
+
+    Decision::Allow
+}
+
 fn check_capabilities(policy: &Policy, op: &Op) -> Option<Decision> {
     let caps = policy.capabilities.as_ref();
     let (cap, default_allowed) = match op {
@@ -1032,6 +1123,76 @@ mod tests {
 
     fn policy_from(v: serde_json::Value) -> Policy {
         serde_json::from_value(v).expect("policy parse")
+    }
+
+    #[test]
+    fn evm_sign_capability_defaults_and_raw_tx_subflag() {
+        use Decision::*;
+        let allow = |d: &Decision| matches!(d, Allow);
+        let deny = |d: &Decision| matches!(d, Deny { .. });
+
+        // now_unix only matters when time_restrictions are set; 0 elsewhere.
+        let t = 0u64;
+
+        // No policy → single-sig, unrestricted (both typed and raw).
+        assert!(allow(&evm_sign_decision(None, false, t)));
+        assert!(allow(&evm_sign_decision(None, true, t)));
+
+        // Policy that never mentions evm_sign → DEFAULT-DENY (like raw_sign/swap),
+        // for both typed-data and raw-tx.
+        let bare = policy_from(json!({
+            "rules": { "transaction_types": ["transfer"] },
+            "capabilities": { "raw_sign": { "allowed": false } }
+        }));
+        assert!(deny(&evm_sign_decision(Some(&bare), false, t)), "evm_sign is default-DENY under a policy");
+        assert!(deny(&evm_sign_decision(Some(&bare), true, t)));
+
+        // Explicitly enabled → typed-data allowed, but raw-tx stays OFF (sub-flag default).
+        let on = policy_from(json!({ "capabilities": { "evm_sign": { "allowed": true } } }));
+        assert!(allow(&evm_sign_decision(Some(&on), false, t)));
+        assert!(deny(&evm_sign_decision(Some(&on), true, t)), "raw_tx is default-OFF");
+
+        // Explicitly disabled → deny everything EVM.
+        let off = policy_from(json!({ "capabilities": { "evm_sign": { "allowed": false } } }));
+        assert!(deny(&evm_sign_decision(Some(&off), false, t)));
+        assert!(deny(&evm_sign_decision(Some(&off), true, t)));
+
+        // raw_tx opted in (with allowed:true) → raw-tx allowed (and typed-data too).
+        let raw_ok = policy_from(json!({ "capabilities": { "evm_sign": { "allowed": true, "raw_tx": true } } }));
+        assert!(allow(&evm_sign_decision(Some(&raw_ok), false, t)));
+        assert!(allow(&evm_sign_decision(Some(&raw_ok), true, t)));
+        // raw_tx:true WITHOUT allowed:true → still denied (base capability default-DENY).
+        let raw_no_base = policy_from(json!({ "capabilities": { "evm_sign": { "raw_tx": true } } }));
+        assert!(deny(&evm_sign_decision(Some(&raw_no_base), true, t)));
+
+        // requires_approval is not wired for EVM → fail closed (capability is allowed).
+        let needs_approval = policy_from(json!({
+            "capabilities": { "evm_sign": { "allowed": true, "requires_approval": true } }
+        }));
+        assert!(deny(&evm_sign_decision(Some(&needs_approval), false, t)));
+
+        // Frozen halts EVM signing too.
+        let frozen = policy_from(json!({
+            "frozen": true,
+            "capabilities": { "evm_sign": { "allowed": true, "raw_tx": true } }
+        }));
+        assert!(matches!(evm_sign_decision(Some(&frozen), false, t), Frozen));
+
+        // time_restrictions gate EVM signing too (same stateless gate as
+        // `evaluate`): allowed_hours [9,17) UTC, with evm_sign explicitly enabled.
+        // 12:00 UTC = 43200s → allowed; 20:00 UTC = 72000s → denied by the window.
+        let hours = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 17] } },
+            "capabilities": { "evm_sign": { "allowed": true } }
+        }));
+        assert!(allow(&evm_sign_decision(Some(&hours), false, 43_200)), "within 9-17 UTC → allow");
+        assert!(deny(&evm_sign_decision(Some(&hours), false, 72_000)), "outside 9-17 UTC → deny");
+        // The window also gates raw-tx when raw_tx is enabled.
+        let hours_raw = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 17] } },
+            "capabilities": { "evm_sign": { "allowed": true, "raw_tx": true } }
+        }));
+        assert!(deny(&evm_sign_decision(Some(&hours_raw), true, 72_000)), "raw-tx outside window → deny");
     }
 
     #[test]

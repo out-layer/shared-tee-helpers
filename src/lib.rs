@@ -14,6 +14,20 @@ use rand::RngCore;
 
 pub mod wallet_policy;
 
+/// Whether `chain` is an EVM (secp256k1) network.
+///
+/// Single source of truth shared by the keystore (address derivation + signing)
+/// and the coordinator (request gating) so the two can't drift on which chains
+/// are EVM. Accepts canonical long names and 1Click-style short aliases; all of
+/// these resolve to ONE derived secp256k1 address.
+pub fn is_evm_chain(chain: &str) -> bool {
+    matches!(
+        chain,
+        "ethereum" | "eth" | "polygon" | "pol" | "matic" | "base" | "arbitrum" | "arb"
+            | "optimism" | "op" | "bsc" | "avalanche" | "avax"
+    )
+}
+
 /// Generate a random 32-byte challenge as hex string (64 chars).
 pub fn generate_challenge() -> String {
     let mut bytes = [0u8; 32];
@@ -248,6 +262,19 @@ pub enum TeeAuthError {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn test_is_evm_chain() {
+        for c in [
+            "ethereum", "eth", "polygon", "pol", "matic", "base", "arbitrum", "arb", "optimism",
+            "op", "bsc", "avalanche", "avax",
+        ] {
+            assert!(is_evm_chain(c), "{c} should be EVM");
+        }
+        for c in ["near", "solana", "sol", "bitcoin", "btc", ""] {
+            assert!(!is_evm_chain(c), "{c} must not be EVM");
+        }
+    }
 
     #[test]
     fn test_challenge_generation() {
