@@ -28,6 +28,16 @@ pub fn is_evm_chain(chain: &str) -> bool {
     )
 }
 
+/// Whether `chain` is Solana (ed25519, seed `wallet:{id}:solana`).
+///
+/// Same single-source-of-truth role as [`is_evm_chain`]: shared by the
+/// keystore (signing) and the coordinator (request gating). Accepts the
+/// canonical name and the 1Click-style short alias; both resolve to the ONE
+/// derived ed25519 key on the canonical `solana` seed suffix.
+pub fn is_solana_chain(chain: &str) -> bool {
+    matches!(chain, "solana" | "sol")
+}
+
 /// Generate a random 32-byte challenge as hex string (64 chars).
 pub fn generate_challenge() -> String {
     let mut bytes = [0u8; 32];

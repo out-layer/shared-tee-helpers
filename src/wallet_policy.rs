@@ -633,6 +633,16 @@ pub struct Capabilities {
     /// (default-OFF) additionally gates raw-transaction signing.
     #[serde(default)]
     pub evm_sign: Option<Capability>,
+    /// Solana signing (raw message bytes / serialized transaction message).
+    /// **Default-DENY under a policy** — same model as [`Capabilities::evm_sign`]:
+    /// a policy must explicitly set `allowed: true` (a wallet with NO policy is
+    /// unrestricted). See [`solana_sign_decision`]. The `raw_tx` sub-flag
+    /// (default-OFF) additionally gates transaction signing; the base flag
+    /// covers message signing only, and the keystore rejects a "message" whose
+    /// bytes parse as a valid Solana transaction message so the sub-flag can't
+    /// be bypassed through the message endpoint.
+    #[serde(default)]
+    pub solana_sign: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -651,11 +661,14 @@ pub struct Capability {
     /// under a policy → no `sign_message` recipient is permitted.
     #[serde(default)]
     pub allowed_recipients: Option<Vec<String>>,
-    /// `evm_sign` only: additionally permit signing **raw EVM transactions**
-    /// (arbitrary contract calls / native-value transfers). Default-OFF. This
-    /// is a kill-switch for arbitrary raw tx only — it does NOT contain
-    /// typed-data fund drains (EIP-3009 `transferWithAuthorization` ≈ transfer
-    /// and EIP-2612 `Permit` ≈ approve ride the base `evm_sign` capability).
+    /// `evm_sign` / `solana_sign` only: additionally permit signing **raw
+    /// transactions** (arbitrary contract calls / native-value transfers).
+    /// Default-OFF. For EVM this is a kill-switch for arbitrary raw tx only —
+    /// it does NOT contain typed-data fund drains (EIP-3009
+    /// `transferWithAuthorization` ≈ transfer and EIP-2612 `Permit` ≈ approve
+    /// ride the base `evm_sign` capability). For Solana it gates
+    /// `sign-transaction`; the message endpoint cannot smuggle a tx past it
+    /// (the keystore rejects message bytes that parse as a tx message).
     #[serde(default)]
     pub raw_tx: Option<bool>,
 }
@@ -1011,6 +1024,41 @@ fn check_time_restrictions(tr: &TimeRestrictions, now_unix: u64) -> Option<Decis
 /// apply: an EVM signing request carries no amount/token/recipient, and the
 /// keystore neither broadcasts nor meters EVM signatures.
 pub fn evm_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u64) -> Decision {
+    chain_sign_decision(policy, |c| c.evm_sign.as_ref(), "EVM", "evm_sign", want_raw_tx, now_unix)
+}
+
+/// Decision for a Solana signing request (sign-message / sign-transaction).
+/// Identical model to [`evm_sign_decision`] — same defaults, same global
+/// gates, same fail-closed `requires_approval`, same `raw_tx` sub-flag for
+/// transaction signing — just keyed on `capabilities.solana_sign`.
+///
+/// CAVEAT (why this must be opt-in, mirroring `evm_sign`): a Solana signature
+/// over a transaction message is itself fund-moving, so `solana_sign` +
+/// `raw_tx` grants full authority over the wallet's Solana float. The base
+/// flag covers message signing only; the keystore additionally rejects
+/// "message" bytes that parse as a valid transaction message, so the message
+/// endpoint cannot bypass the `raw_tx` sub-flag.
+pub fn solana_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u64) -> Decision {
+    chain_sign_decision(
+        policy,
+        |c| c.solana_sign.as_ref(),
+        "Solana",
+        "solana_sign",
+        want_raw_tx,
+        now_unix,
+    )
+}
+
+/// Shared body of [`evm_sign_decision`] / [`solana_sign_decision`] — one
+/// implementation so the two chains can't drift on defaults or gate order.
+fn chain_sign_decision(
+    policy: Option<&Policy>,
+    cap_field: fn(&Capabilities) -> Option<&Capability>,
+    label: &str,
+    cap_name: &str,
+    want_raw_tx: bool,
+    now_unix: u64,
+) -> Decision {
     let policy = match policy {
         // No on-chain policy → single-sig wallet, unrestricted (as today).
         None => return Decision::Allow,
@@ -1019,37 +1067,39 @@ pub fn evm_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u
     if policy.frozen {
         return Decision::Frozen;
     }
-    // Owner-set time window gates EVM signing too (same stateless global gate as
-    // `evaluate` step 8) — reuse the shared helper, don't reimplement time math.
+    // Owner-set time window gates chain signing too (same stateless global gate
+    // as `evaluate` step 8) — reuse the shared helper, don't reimplement time math.
     if let Some(tr) = policy.rules.as_ref().and_then(|r| r.time_restrictions.as_ref()) {
         if let Some(decision) = check_time_restrictions(tr, now_unix) {
             return decision;
         }
     }
-    let cap = policy.capabilities.as_ref().and_then(|c| c.evm_sign.as_ref());
+    let cap = policy.capabilities.as_ref().and_then(cap_field);
 
     // Base capability: DEFAULT-DENY under a policy (like raw_sign/swap/etc.).
-    // A policy must explicitly set `evm_sign.allowed = true` to permit signing.
+    // A policy must explicitly set `<cap>.allowed = true` to permit signing.
     if !cap.and_then(|c| c.allowed).unwrap_or(false) {
-        return deny(
-            "EVM signing is not enabled by policy (set capabilities.evm_sign.allowed = true)"
-                .to_string(),
-        );
+        return deny(format!(
+            "{} signing is not enabled by policy (set capabilities.{}.allowed = true)",
+            label, cap_name
+        ));
     }
 
-    // Per-op approval is not wired for EVM signing in v1. Fail closed rather
+    // Per-op approval is not wired for chain signing in v1. Fail closed rather
     // than silently ignore an owner who set `requires_approval`.
     if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
-        return deny(
-            "evm_sign.requires_approval is not supported — per-op approval for EVM signing is unavailable".to_string(),
-        );
+        return deny(format!(
+            "{}.requires_approval is not supported — per-op approval for {} signing is unavailable",
+            cap_name, label
+        ));
     }
 
     // Raw transactions need the explicit sub-flag (default-OFF).
     if want_raw_tx && !cap.and_then(|c| c.raw_tx).unwrap_or(false) {
-        return deny(
-            "Raw EVM transaction signing requires capabilities.evm_sign.raw_tx = true".to_string(),
-        );
+        return deny(format!(
+            "Raw {} transaction signing requires capabilities.{}.raw_tx = true",
+            label, cap_name
+        ));
     }
 
     Decision::Allow
@@ -1193,6 +1243,70 @@ mod tests {
             "capabilities": { "evm_sign": { "allowed": true, "raw_tx": true } }
         }));
         assert!(deny(&evm_sign_decision(Some(&hours_raw), true, 72_000)), "raw-tx outside window → deny");
+    }
+
+    #[test]
+    fn solana_sign_capability_defaults_and_raw_tx_subflag() {
+        use Decision::*;
+        let allow = |d: &Decision| matches!(d, Allow);
+        let deny = |d: &Decision| matches!(d, Deny { .. });
+        let t = 0u64;
+
+        // No policy → single-sig, unrestricted (both message and tx).
+        assert!(allow(&solana_sign_decision(None, false, t)));
+        assert!(allow(&solana_sign_decision(None, true, t)));
+
+        // Policy that never mentions solana_sign → DEFAULT-DENY (like evm_sign).
+        let bare = policy_from(json!({
+            "rules": { "transaction_types": ["transfer"] },
+            "capabilities": { "evm_sign": { "allowed": true } }
+        }));
+        assert!(deny(&solana_sign_decision(Some(&bare), false, t)), "solana_sign is default-DENY under a policy");
+        assert!(deny(&solana_sign_decision(Some(&bare), true, t)));
+
+        // Explicitly enabled → messages allowed, but tx stays OFF (sub-flag default).
+        let on = policy_from(json!({ "capabilities": { "solana_sign": { "allowed": true } } }));
+        assert!(allow(&solana_sign_decision(Some(&on), false, t)));
+        assert!(deny(&solana_sign_decision(Some(&on), true, t)), "raw_tx is default-OFF");
+
+        // Explicitly disabled → deny everything Solana.
+        let off = policy_from(json!({ "capabilities": { "solana_sign": { "allowed": false } } }));
+        assert!(deny(&solana_sign_decision(Some(&off), false, t)));
+        assert!(deny(&solana_sign_decision(Some(&off), true, t)));
+
+        // raw_tx opted in (with allowed:true) → tx allowed (and messages too).
+        let raw_ok = policy_from(json!({ "capabilities": { "solana_sign": { "allowed": true, "raw_tx": true } } }));
+        assert!(allow(&solana_sign_decision(Some(&raw_ok), false, t)));
+        assert!(allow(&solana_sign_decision(Some(&raw_ok), true, t)));
+        // raw_tx:true WITHOUT allowed:true → still denied (base capability default-DENY).
+        let raw_no_base = policy_from(json!({ "capabilities": { "solana_sign": { "raw_tx": true } } }));
+        assert!(deny(&solana_sign_decision(Some(&raw_no_base), true, t)));
+
+        // requires_approval is not wired for Solana → fail closed.
+        let needs_approval = policy_from(json!({
+            "capabilities": { "solana_sign": { "allowed": true, "requires_approval": true } }
+        }));
+        assert!(deny(&solana_sign_decision(Some(&needs_approval), false, t)));
+
+        // Frozen halts Solana signing too.
+        let frozen = policy_from(json!({
+            "frozen": true,
+            "capabilities": { "solana_sign": { "allowed": true, "raw_tx": true } }
+        }));
+        assert!(matches!(solana_sign_decision(Some(&frozen), false, t), Frozen));
+
+        // time_restrictions gate Solana signing too (shared stateless gate).
+        let hours = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 17] } },
+            "capabilities": { "solana_sign": { "allowed": true, "raw_tx": true } }
+        }));
+        assert!(allow(&solana_sign_decision(Some(&hours), false, 43_200)), "within 9-17 UTC → allow");
+        assert!(deny(&solana_sign_decision(Some(&hours), true, 72_000)), "outside 9-17 UTC → deny");
+
+        // The two chains stay independent: evm_sign on ≠ solana_sign on.
+        let evm_only = policy_from(json!({ "capabilities": { "evm_sign": { "allowed": true, "raw_tx": true } } }));
+        assert!(deny(&solana_sign_decision(Some(&evm_only), false, t)));
+        assert!(allow(&evm_sign_decision(Some(&evm_only), true, t)));
     }
 
     #[test]
