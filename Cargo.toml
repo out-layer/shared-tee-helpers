@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Crypto
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+# Crypto — near-crypto verifies ed25519, secp256k1 and ml-dsa-65 (FIPS-204 post-quantum)
+# signatures uniformly, using the same aws-lc-rs ML-DSA backend nearcore signs with.
+near-crypto = "0.37"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"

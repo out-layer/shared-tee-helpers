@@ -9,10 +9,49 @@
 //! 3. Server verifies signature via `verify_signature()`
 //! 4. Server checks key exists on register-contract via `check_access_key_on_contract()`
 
-use ed25519_dalek::{Signature, VerifyingKey};
+use near_crypto::{KeyType, PublicKey, Signature};
 use rand::RngCore;
+use std::str::FromStr;
 
 pub mod wallet_policy;
+
+/// Which signature schemes the server is willing to accept for TEE session auth.
+///
+/// The worker announces its scheme in the `public_key`/`signature` strings (NEAR canonical
+/// form, e.g. `ml-dsa-65:...`). The server decides — via this allowlist, driven by an env var —
+/// whether that scheme is acceptable. There is deliberately NO auto-detect fallback to the old
+/// hex-ed25519 wire format: every worker is redeployed with the NEAR-canonical form, so a legacy
+/// path would only be a latent regression surface.
+#[derive(Debug, Clone, Copy)]
+pub struct AllowedKeyTypes {
+    pub ed25519: bool,
+    pub ml_dsa_65: bool,
+}
+
+impl AllowedKeyTypes {
+    /// Parse from a comma-separated env value, e.g. `"ed25519,ml-dsa-65"`.
+    /// Unknown tokens are ignored; unset/empty yields an all-deny set (caller must opt in).
+    pub fn from_csv(s: &str) -> Self {
+        let mut a = AllowedKeyTypes { ed25519: false, ml_dsa_65: false };
+        for tok in s.split(',') {
+            match tok.trim().to_ascii_lowercase().as_str() {
+                "ed25519" => a.ed25519 = true,
+                "ml-dsa-65" | "ml_dsa_65" | "mldsa65" | "ml-dsa" => a.ml_dsa_65 = true,
+                "" => {}
+                _ => {}
+            }
+        }
+        a
+    }
+
+    fn allows(&self, kt: KeyType) -> bool {
+        match kt {
+            KeyType::ED25519 => self.ed25519,
+            KeyType::MLDSA65 => self.ml_dsa_65,
+            _ => false,
+        }
+    }
+}
 
 /// Whether `chain` is an EVM (secp256k1) network.
 ///
@@ -45,49 +84,44 @@ pub fn generate_challenge() -> String {
     hex::encode(bytes)
 }
 
-/// Verify an ed25519 signature over a challenge.
+/// Verify a challenge signature in NEAR canonical form, gated by an allowlist.
+///
+/// Handles ed25519 and ml-dsa-65 (FIPS-204) uniformly via near-crypto. The key type is taken
+/// from the `public_key`/`signature` strings themselves (their scheme prefix), then checked
+/// against `allowed` — so the server, not the worker, decides which schemes are acceptable.
 ///
 /// # Arguments
-/// * `public_key` - "ed25519:..." format (base58-encoded) or raw hex (64 chars)
+/// * `public_key` - NEAR canonical form, e.g. `ed25519:<base58>` or `ml-dsa-65:<base58>`
 /// * `challenge` - hex-encoded challenge string (as returned by `generate_challenge`)
-/// * `signature` - hex-encoded ed25519 signature (128 hex chars = 64 bytes)
+/// * `signature` - NEAR canonical form, e.g. `ed25519:<base58>` or `ml-dsa-65:<base58>`
+/// * `allowed` - which schemes this server accepts (from env; see [`AllowedKeyTypes`])
 pub fn verify_signature(
     public_key: &str,
     challenge: &str,
     signature: &str,
+    allowed: AllowedKeyTypes,
 ) -> Result<(), TeeAuthError> {
-    // Parse public key
-    let pk_bytes = parse_public_key_bytes(public_key)?;
-    let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
-        .map_err(|e| TeeAuthError::InvalidPublicKey(format!("ed25519 parse error: {}", e)))?;
+    let pk = PublicKey::from_str(public_key)
+        .map_err(|e| TeeAuthError::InvalidPublicKey(format!("parse error: {}", e)))?;
 
-    // Parse signature
-    let sig_bytes = hex::decode(signature)
-        .map_err(|e| TeeAuthError::InvalidSignature(format!("hex decode error: {}", e)))?;
-    if sig_bytes.len() != 64 {
-        return Err(TeeAuthError::InvalidSignature(format!(
-            "expected 64 bytes, got {}",
-            sig_bytes.len()
-        )));
+    // Server-side policy: reject a scheme this deployment has not opted into, BEFORE spending
+    // cycles on verification.
+    if !allowed.allows(pk.key_type()) {
+        return Err(TeeAuthError::KeyTypeNotAllowed(format!("{}", pk.key_type())));
     }
-    let sig = Signature::from_bytes(
-        sig_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| TeeAuthError::InvalidSignature("slice conversion failed".into()))?,
-    );
 
-    // Parse challenge (verify the raw challenge bytes, not the hex string)
+    let sig = Signature::from_str(signature)
+        .map_err(|e| TeeAuthError::InvalidSignature(format!("parse error: {}", e)))?;
+
+    // Verify the raw challenge bytes (not the hex string).
     let challenge_bytes = hex::decode(challenge)
         .map_err(|e| TeeAuthError::InvalidChallenge(format!("hex decode error: {}", e)))?;
 
-    // Verify
-    use ed25519_dalek::Verifier;
-    verifying_key
-        .verify(&challenge_bytes, &sig)
-        .map_err(|_| TeeAuthError::SignatureVerificationFailed)?;
-
-    Ok(())
+    if sig.verify(&challenge_bytes, &pk) {
+        Ok(())
+    } else {
+        Err(TeeAuthError::SignatureVerificationFailed)
+    }
 }
 
 /// Check if a public key exists as an access key on a NEAR account via RPC.
@@ -106,11 +140,12 @@ pub async fn check_access_key_on_contract(
     account_id: &str,
     public_key: &str,
 ) -> Result<bool, TeeAuthError> {
-    // Ensure key is in "ed25519:..." format for NEAR RPC
-    let near_key = if public_key.starts_with("ed25519:") {
+    // NEAR RPC wants the canonical `<scheme>:<base58>` form. Any key already carrying a scheme
+    // prefix (ed25519:, secp256k1:, ml-dsa-65:) is passed through untouched; a bare 64-char hex
+    // string is treated as a legacy raw ed25519 key.
+    let near_key = if public_key.contains(':') {
         public_key.to_string()
     } else {
-        // Assume hex-encoded raw bytes, convert to base58 with prefix
         let bytes = hex::decode(public_key)
             .map_err(|e| TeeAuthError::InvalidPublicKey(format!("hex decode: {}", e)))?;
         format!("ed25519:{}", bs58::encode(&bytes).into_string())
@@ -225,35 +260,6 @@ pub async fn check_access_key_with_retry(
     Ok(false)
 }
 
-/// Parse public key bytes from "ed25519:..." (base58) or raw hex format.
-fn parse_public_key_bytes(public_key: &str) -> Result<[u8; 32], TeeAuthError> {
-    let raw_bytes = if let Some(b58) = public_key.strip_prefix("ed25519:") {
-        bs58::decode(b58)
-            .into_vec()
-            .map_err(|e| TeeAuthError::InvalidPublicKey(format!("base58 decode: {}", e)))?
-    } else if public_key.len() == 64 {
-        // Assume hex
-        hex::decode(public_key)
-            .map_err(|e| TeeAuthError::InvalidPublicKey(format!("hex decode: {}", e)))?
-    } else {
-        return Err(TeeAuthError::InvalidPublicKey(format!(
-            "unrecognized format (expected 'ed25519:...' or 64 hex chars): {}",
-            public_key
-        )));
-    };
-
-    if raw_bytes.len() != 32 {
-        return Err(TeeAuthError::InvalidPublicKey(format!(
-            "expected 32 bytes, got {}",
-            raw_bytes.len()
-        )));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&raw_bytes);
-    Ok(arr)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TeeAuthError {
     #[error("invalid public key: {0}")]
@@ -264,6 +270,8 @@ pub enum TeeAuthError {
     InvalidChallenge(String),
     #[error("signature verification failed")]
     SignatureVerificationFailed,
+    #[error("key type not allowed by this server: {0}")]
+    KeyTypeNotAllowed(String),
     #[error("NEAR RPC error: {0}")]
     NearRpcError(String),
 }
@@ -271,7 +279,59 @@ pub enum TeeAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
+    use near_crypto::SecretKey;
+
+    const BOTH: AllowedKeyTypes = AllowedKeyTypes { ed25519: true, ml_dsa_65: true };
+
+    fn sign_ok(sk: &SecretKey) {
+        let challenge = generate_challenge();
+        let challenge_bytes = hex::decode(&challenge).unwrap();
+        let sig = sk.sign(&challenge_bytes);
+        verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH).unwrap();
+    }
+
+    #[test]
+    fn test_verify_ed25519() {
+        sign_ok(&SecretKey::from_random(KeyType::ED25519));
+    }
+
+    #[test]
+    fn test_verify_ml_dsa_65() {
+        sign_ok(&SecretKey::from_random(KeyType::MLDSA65));
+    }
+
+    #[test]
+    fn test_key_type_not_allowed() {
+        // ml-dsa signature is valid, but this server only accepts ed25519.
+        let sk = SecretKey::from_random(KeyType::MLDSA65);
+        let challenge = generate_challenge();
+        let sig = sk.sign(&hex::decode(&challenge).unwrap());
+        let only_ed = AllowedKeyTypes { ed25519: true, ml_dsa_65: false };
+        let err = verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), only_ed)
+            .unwrap_err();
+        assert!(matches!(err, TeeAuthError::KeyTypeNotAllowed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_verify_wrong_signature() {
+        let sk = SecretKey::from_random(KeyType::ED25519);
+        let other = SecretKey::from_random(KeyType::ED25519);
+        let challenge = generate_challenge();
+        let sig = other.sign(&hex::decode(&challenge).unwrap()); // signed by the wrong key
+        let err = verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH)
+            .unwrap_err();
+        assert!(matches!(err, TeeAuthError::SignatureVerificationFailed), "got {err:?}");
+    }
+
+    #[test]
+    fn test_from_csv() {
+        let a = AllowedKeyTypes::from_csv("ed25519, ml-dsa-65");
+        assert!(a.ed25519 && a.ml_dsa_65);
+        let b = AllowedKeyTypes::from_csv("ed25519");
+        assert!(b.ed25519 && !b.ml_dsa_65);
+        let c = AllowedKeyTypes::from_csv("");
+        assert!(!c.ed25519 && !c.ml_dsa_65);
+    }
 
     #[test]
     fn test_is_evm_chain() {
@@ -294,83 +354,4 @@ mod tests {
         assert_ne!(c1, c2); // Should be random
     }
 
-    #[test]
-    fn test_sign_and_verify() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let verifying_key = signing_key.verifying_key();
-        let pub_key_hex = hex::encode(verifying_key.as_bytes());
-
-        let challenge = generate_challenge();
-        let challenge_bytes = hex::decode(&challenge).unwrap();
-
-        use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
-        let sig_hex = hex::encode(signature.to_bytes());
-
-        // Should succeed
-        verify_signature(&pub_key_hex, &challenge, &sig_hex).unwrap();
-    }
-
-    #[test]
-    fn test_verify_wrong_signature() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let verifying_key = signing_key.verifying_key();
-        let pub_key_hex = hex::encode(verifying_key.as_bytes());
-
-        let challenge = generate_challenge();
-
-        // Wrong signature (all zeros)
-        let bad_sig = hex::encode([0u8; 64]);
-
-        let result = verify_signature(&pub_key_hex, &challenge, &bad_sig);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_verify_wrong_key() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let other_key = SigningKey::generate(&mut rand::thread_rng());
-        let other_pub_hex = hex::encode(other_key.verifying_key().as_bytes());
-
-        let challenge = generate_challenge();
-        let challenge_bytes = hex::decode(&challenge).unwrap();
-
-        use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
-        let sig_hex = hex::encode(signature.to_bytes());
-
-        // Verify with wrong public key
-        let result = verify_signature(&other_pub_hex, &challenge, &sig_hex);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_ed25519_prefix_format() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let verifying_key = signing_key.verifying_key();
-        let pub_key_b58 = format!("ed25519:{}", bs58::encode(verifying_key.as_bytes()).into_string());
-
-        let challenge = generate_challenge();
-        let challenge_bytes = hex::decode(&challenge).unwrap();
-
-        use ed25519_dalek::Signer;
-        let signature = signing_key.sign(&challenge_bytes);
-        let sig_hex = hex::encode(signature.to_bytes());
-
-        verify_signature(&pub_key_b58, &challenge, &sig_hex).unwrap();
-    }
-
-    #[test]
-    fn test_parse_public_key_hex_and_bs58() {
-        let signing_key = SigningKey::generate(&mut rand::thread_rng());
-        let pk_bytes = signing_key.verifying_key().to_bytes();
-        let pk_hex = hex::encode(pk_bytes);
-        let pk_b58 = format!("ed25519:{}", bs58::encode(&pk_bytes).into_string());
-
-        // Both formats should parse to the same bytes
-        let from_hex = parse_public_key_bytes(&pk_hex).unwrap();
-        let from_b58 = parse_public_key_bytes(&pk_b58).unwrap();
-        assert_eq!(from_hex, pk_bytes);
-        assert_eq!(from_b58, pk_bytes);
-    }
 }
