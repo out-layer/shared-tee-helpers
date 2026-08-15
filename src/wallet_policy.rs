@@ -37,7 +37,10 @@ use std::collections::BTreeMap;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Op {
     /// Native NEAR transfer. Built: keystore constructs the NEAR tx from these fields.
-    Transfer { to: String, amount: String },
+    Transfer {
+        to: String,
+        amount: String,
+    },
 
     /// Function call. Built: keystore constructs the NEAR tx. `args_base64` is the
     /// EXACT argument bytes (base64) so they cannot be renormalized by any JSON layer.
@@ -148,7 +151,10 @@ pub enum Op {
     /// carries NO destination and is gated by a default-DENY `payment_check` CAPABILITY
     /// (opt-in, like raw_sign/confidential) plus the per-token amount limit. Trusted: the
     /// coordinator builds the transfer-to-ephemeral artifact.
-    PaymentCheck { amount: String, token: String },
+    PaymentCheck {
+        amount: String,
+        token: String,
+    },
 
     /// OutLayer coordinator authentication (Bearer-near / register / api-key). The
     /// keystore CONSTRUCTS a domain-separated `<prefix>:<seed>:<ts>[:<vault>]` string
@@ -318,6 +324,14 @@ pub fn canonical_json(op: &Op) -> String {
     serde_json::to_string(&canonical).expect("Value serialization is infallible")
 }
 
+// ---------------------------------------------------------------------------
+/// A wallet signs with its own key, always. There are no connector sub-keys.
+///
+/// If a connector ever needs to act under an address of its own, that is a
+/// feature to design then, and the hard part is not the derivation: a
+/// connector-scoped signature has to move the MESSAGE, the SIGNATURE and the
+/// BALANCE the funds leave from to that address together.
+
 /// `sha256(canonical_json(op))` as lowercase hex.
 pub fn request_hash(op: &Op) -> String {
     let mut hasher = Sha256::new();
@@ -343,10 +357,6 @@ fn canonicalize_value(value: &serde_json::Value) -> serde_json::Value {
         other => other.clone(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Op accessors used by policy evaluation
-// ---------------------------------------------------------------------------
 
 impl Op {
     /// The policy `transaction_types` strings this op is allowed to match against.
@@ -485,6 +495,7 @@ pub struct Policy {
     #[serde(default)]
     pub webhook_url: Option<String>,
 }
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Rules {
@@ -745,10 +756,35 @@ pub enum Decision {
 /// `now_unix` is the current Unix time in seconds (used only by time_restrictions);
 /// the function is otherwise pure for reproducible test vectors.
 pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) -> Decision {
+    // The wallet's own verdict, decided FIRST and on its own terms.
+    let wallet = evaluate_section(
+        policy.frozen,
+        policy.rules.as_ref(),
+        policy.capabilities.as_ref(),
+        policy.approval.as_ref(),
+        op,
+        usage,
+        now_unix,
+    );
+
+    wallet
+}
+
+/// Evaluate one rule set in isolation.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_section(
+    frozen: bool,
+    rules: Option<&Rules>,
+    capabilities: Option<&Capabilities>,
+    approval: Option<&Approval>,
+    op: &Op,
+    usage: Option<&Usage>,
+    now_unix: u64,
+) -> Decision {
     // 1. Frozen wallet — reject EVERYTHING, including auth. A freeze fully halts the
     //    wallet; the controller's intent is a hard stop, so even identity proofs are
     //    refused until it is unfrozen.
-    if policy.frozen {
+    if frozen {
         return Decision::Frozen;
     }
 
@@ -759,8 +795,6 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
     if matches!(op, Op::Auth { .. }) {
         return Decision::Allow;
     }
-
-    let rules = policy.rules.as_ref();
 
     // 3. transaction_types (STATELESS). Deployed policies may list the legacy
     //    deposit-family types (`intents_deposit`/`storage_deposit`/`cross_chain_deposit`),
@@ -898,13 +932,13 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
 
     // 9. capabilities (STATELESS) — gate the non-Built primitives and decide whether
     // they need approval, independent of the generic threshold.
-    if let Some(decision) = check_capabilities(policy, op) {
+    if let Some(decision) = check_capabilities(capabilities, approval, op) {
         return decision;
     }
 
     // 10. generic multisig trigger (STATELESS) for fund-moving kinds.
     if op.triggers_generic_approval() {
-        if let Some(approval) = policy.approval.as_ref() {
+        if let Some(approval) = approval {
             let excluded = approval
                 .excluded_types
                 .as_ref()
@@ -1023,6 +1057,9 @@ fn check_time_restrictions(tr: &TimeRestrictions, now_unix: u64) -> Option<Decis
 /// (amount/token/recipient limits) and STATEFUL velocity/rate-limits do NOT
 /// apply: an EVM signing request carries no amount/token/recipient, and the
 /// keystore neither broadcasts nor meters EVM signatures.
+///
+/// **No connector is in this decision**: a wallet signs with its own key,
+/// always. See the note above [`request_hash`].
 pub fn evm_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u64) -> Decision {
     chain_sign_decision(policy, |c| c.evm_sign.as_ref(), "EVM", "evm_sign", want_raw_tx, now_unix)
 }
@@ -1105,8 +1142,11 @@ fn chain_sign_decision(
     Decision::Allow
 }
 
-fn check_capabilities(policy: &Policy, op: &Op) -> Option<Decision> {
-    let caps = policy.capabilities.as_ref();
+fn check_capabilities(
+    caps: Option<&Capabilities>,
+    approval: Option<&Approval>,
+    op: &Op,
+) -> Option<Decision> {
     let (cap, default_allowed) = match op {
         // raw signing is powerful and opaque: default-DENY unless explicitly enabled.
         Op::Raw { .. } => (caps.and_then(|c| c.raw_sign.as_ref()), false),
@@ -1148,7 +1188,7 @@ fn check_capabilities(policy: &Policy, op: &Op) -> Option<Decision> {
     if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
         // The threshold comes from the approval block; absent → fail-closed (a
         // capability that demands approval but has no approvers is a misconfiguration).
-        match policy.approval.as_ref().and_then(|a| a.threshold.as_ref()) {
+        match approval.and_then(|a| a.threshold.as_ref()) {
             Some(threshold) => {
                 return Some(Decision::RequiresApproval {
                     threshold: threshold.required(),
@@ -1322,8 +1362,7 @@ mod tests {
         let op = Op::SignMessage {
             message_hash: "ab".into(),
             recipient: "app.example.near".into(),
-            purpose: None,
-        };
+            purpose: None };
         assert!(
             matches!(evaluate(&policy, &op, None, 0), Decision::Allow),
             "sign_message must not be denied by transaction_types/allowed_tokens"
@@ -1342,8 +1381,7 @@ mod tests {
                 method: "m".into(),
                 args_base64: "e30=".into(),
                 gas: "30000000000000".into(),
-                deposit: "0".into()
-            }),
+                deposit: "0".into() }),
             BindMode::Built
         );
         assert_eq!(bind_mode(&Op::Delete { beneficiary: "a.near".into() }), BindMode::Built);
@@ -1364,8 +1402,7 @@ mod tests {
                 token_in: "a".into(),
                 amount_in: "1".into(),
                 token_out: "b".into(),
-                min_out: "1".into()
-            }),
+                min_out: "1".into() }),
             BindMode::Trusted
         );
         assert_eq!(
@@ -1376,8 +1413,7 @@ mod tests {
                 token: "near".into(),
                 chain: Some("near".into()),
                 token_out: None,
-                min_amount_out: None
-            }),
+                min_amount_out: None }),
             BindMode::Trusted
         );
         assert_eq!(
@@ -1385,8 +1421,7 @@ mod tests {
                 to: "0xabc".into(),
                 amount: "1".into(),
                 token: "nep141:usdt.tether-token.near".into(),
-                chain: "ethereum".into()
-            }),
+                chain: "ethereum".into() }),
             BindMode::Trusted
         );
     }
@@ -1462,8 +1497,7 @@ mod tests {
         let op = Op::IntentsTransfer {
             to: "partner.near".into(),
             amount: "1000".into(),
-            token: "nep141:usdt.tether-token.near".into(),
-        };
+            token: "nep141:usdt.tether-token.near".into() };
         // Built (keystore constructs the transfer intent → recipient can't be substituted).
         assert_eq!(bind_mode(&op), BindMode::Built);
         // Its OWN type — NOT folded into native `transfer` or `withdraw`.
@@ -1493,8 +1527,7 @@ mod tests {
             token_in: "nep141:wrap.near".into(),
             amount_in: "1".into(),
             token_out: "nep141:usdt.tether-token.near".into(),
-            min_out: "1".into(),
-        };
+            min_out: "1".into() };
         // No transaction_types, no capabilities → DENY (previously this allowed).
         let bare: Policy = serde_json::from_str(r#"{"rules":{}}"#).unwrap();
         assert!(matches!(evaluate(&bare, &op, None, 0), Decision::Deny { .. }));
@@ -1552,8 +1585,7 @@ mod tests {
             to: "0xRecipient".into(),
             amount: "5".into(),
             token: "nep141:usdt.tether-token.near".into(),
-            chain: "ethereum".into(),
-        };
+            chain: "ethereum".into() };
         assert_eq!(op.type_aliases(), &["cross_chain_withdraw"]);
         assert_eq!(op.destination(), Some("0xRecipient"));
         assert_eq!(op.amount(), Some("5"));
@@ -1602,8 +1634,7 @@ mod tests {
             to: "0xRecipient".into(),
             amount: "50".into(),
             token: "nep141:usdt.tether-token.near".into(),
-            chain: "ethereum".into(),
-        };
+            chain: "ethereum".into() };
         assert!(matches!(evaluate(&policy, &over, None, 0), Decision::Deny { .. }));
 
         // Destination not on the whitelist → Deny.
@@ -1611,8 +1642,7 @@ mod tests {
             to: "0xAttacker".into(),
             amount: "1".into(),
             token: "nep141:usdt.tether-token.near".into(),
-            chain: "ethereum".into(),
-        };
+            chain: "ethereum".into() };
         assert!(matches!(evaluate(&policy, &bad_to, None, 0), Decision::Deny { .. }));
     }
 
@@ -1823,8 +1853,7 @@ mod tests {
             method: "ft_transfer_call".into(),
             args_base64: "e30=".into(),
             gas: "30000000000000".into(),
-            deposit: "1".into(),
-        };
+            deposit: "1".into() };
         assert_eq!(evaluate(&policy, &call, None, 0), Decision::Allow);
         // But it must NOT admit a transfer (only the deposit family → call).
         let transfer = Op::Transfer { to: "a.near".into(), amount: "1".into() };
@@ -1843,8 +1872,7 @@ mod tests {
             token: "near".into(),
             chain: Some("near".into()),
             token_out: None,
-            min_amount_out: None,
-        };
+            min_amount_out: None };
         // No capabilities → confidential is now default-denied (like raw_sign).
         match evaluate(&Policy::default(), &op, None, 0) {
             Decision::Deny { .. } => {}
@@ -1872,8 +1900,7 @@ mod tests {
             token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: None,
-            min_amount_out: None,
-        };
+            min_amount_out: None };
         assert_eq!(canonical_json(&legacy), canonical_json(&explicit_none));
         assert_eq!(request_hash(&legacy), request_hash(&explicit_none));
         assert_eq!(
@@ -1891,8 +1918,7 @@ mod tests {
             token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: Some("nep141:wrap.near".into()),
-            min_amount_out: Some("4900000".into()),
-        };
+            min_amount_out: Some("4900000".into()) };
         let swap_unbound = Op::Confidential {
             flow: "swap".into(),
             to: Some("0xdeadbeef".into()),
@@ -1900,8 +1926,7 @@ mod tests {
             token: "nep141:usdt.tether-token.near".into(),
             chain: Some("near".into()),
             token_out: None,
-            min_amount_out: None,
-        };
+            min_amount_out: None };
         // Sanity: the unbound variant omits both fields from the canonical form.
         assert!(!canonical_json(&swap_unbound).contains("token_out"));
         assert!(!canonical_json(&swap_unbound).contains("min_amount_out"));

@@ -77,6 +77,25 @@ pub fn is_solana_chain(chain: &str) -> bool {
     matches!(chain, "solana" | "sol")
 }
 
+/// Whether `s` has the shape of a NEAR **implicit account**: 64 lowercase hex.
+///
+/// Single source of truth for the same reason as [`is_evm_chain`], and with a
+/// sharper edge: this shape is what decides whether a secret is an AGENT's.
+///
+/// The keystore fires its agent-secret rule on it — a secret whose profile
+/// looks like an account may be read only by that account, and only if that
+/// account stored it — and the coordinator uses it to decide whether to address
+/// a secret at all. If the two ever disagreed, the coordinator would ask for a
+/// secret under a name the keystore does not police, or refuse to ask for one
+/// the keystore would have guarded. Both are silent failures.
+///
+/// **Lowercase only**, because that is the only form an implicit account takes:
+/// the chain rejects any other spelling, so accepting one here would create a
+/// second name for something that has exactly one.
+pub fn is_implicit_account(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Generate a random 32-byte challenge as hex string (64 chars).
 pub fn generate_challenge() -> String {
     let mut bytes = [0u8; 32];
@@ -282,6 +301,33 @@ mod tests {
     use near_crypto::SecretKey;
 
     const BOTH: AllowedKeyTypes = AllowedKeyTypes { ed25519: true, ml_dsa_65: true };
+
+    /// The shape that decides whether a secret belongs to an agent.
+    ///
+    /// Both halves are load-bearing and in opposite directions. Too WIDE and an
+    /// ordinary profile starts being treated as an account, so a human's secret
+    /// falls under a rule written for agents. Too NARROW and a real agent's
+    /// secret slips past the rule entirely — which is the half that leaks a
+    /// connector credential.
+    #[test]
+    fn an_implicit_account_is_exactly_sixty_four_lowercase_hex() {
+        const AGENT: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+        assert!(is_implicit_account(AGENT));
+        assert!(is_implicit_account(&"0".repeat(64)));
+        assert!(is_implicit_account(&"f".repeat(64)));
+
+        assert!(!is_implicit_account(&AGENT[..63]), "one short");
+        assert!(!is_implicit_account(&format!("{AGENT}a")), "one long");
+        assert!(
+            !is_implicit_account(&AGENT.to_uppercase()),
+            "the chain rejects this spelling, so accepting it would create a second \
+             name for one account"
+        );
+        assert!(!is_implicit_account(&format!("{}g", &AGENT[..63])), "not hex");
+        assert!(!is_implicit_account("alice.near"));
+        assert!(!is_implicit_account(""));
+    }
 
     fn sign_ok(sk: &SecretKey) {
         let challenge = generate_challenge();
