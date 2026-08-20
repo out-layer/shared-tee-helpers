@@ -19,6 +19,8 @@ reqwest = { version = "0.11", features = ["json"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# w_execute_extension request decoding: FunctionCall.args travel as base64
+base64 = "0.22"
 
 # Error handling
 anyhow = "1.0"
@@ -29,3 +31,19 @@ tokio = { version = "1", features = ["time"] }
 
 # Logging
 tracing = "0.1"
+
+[dev-dependencies]
+# Fuzzing the `w_execute_extension` decoder. A panic inside the decoder is a
+# denial of service ON THE ENCLAVE — the request body is caller-chosen and the
+# decoder runs before anything is signed — so "never panics" has to be a
+# property, not an impression left by the examples we happened to write.
+arbitrary = { version = "1", features = ["derive"] }
+
+# Round-trip against the UPSTREAM wire types, pinned to the rev our frozen
+# structs were transcribed from. The golden vectors prove our RULES match the
+# contract's; this proves our STRUCTS still match the format. Two different
+# ways to be wrong, and D2's frozen structs can drift silently without it.
+#
+# A dev-dependency, so nothing here reaches the measured enclave image.
+defuse-wallet = { git = "https://github.com/near/intents", rev = "6095765f", default-features = false, features = ["serde"] }
+defuse-near-promise = { git = "https://github.com/near/intents", rev = "6095765f", default-features = false, features = ["serde"] }

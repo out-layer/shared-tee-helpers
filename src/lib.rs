@@ -13,7 +13,14 @@ use near_crypto::{KeyType, PublicKey, Signature};
 use rand::RngCore;
 use std::str::FromStr;
 
+pub mod binding;
+pub mod hos;
+/// Golden vectors transcribed from the HoS wallet's own test suite — test-only,
+/// because their whole job is to fail when our mirror of that contract drifts.
+#[cfg(test)]
+mod hos_contract_vectors;
 pub mod wallet_policy;
+pub mod wallet_request_decode;
 
 /// Which signature schemes the server is willing to accept for TEE session auth.
 ///

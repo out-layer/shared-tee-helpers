@@ -1,0 +1,1124 @@
+//! The `hos_lease` binding profile — House of Stake "Agent Connect".
+//!
+//! A custody wallet bound to a LEASED, keyless asset account (`agent.tla`).
+//! The wallet's own NEAR implicit account acts as the EXECUTOR: it is
+//! registered in the asset account's control set and is the only identity
+//! that signs the outer transaction.
+//!
+//! This module holds the mode's chain types and its verification rules; the
+//! trait it implements, the dispatch and everything shared between modes live
+//! in [`crate::binding`]. Both registries compile into the measured keystore
+//! image, so nothing outside the enclave can claim "version N parses with
+//! decoder M" and steer an unknown schema into a known parser.
+
+use serde::{Deserialize, Serialize};
+
+use crate::binding::{
+    BindingFault, BindingKind, BindingProfile, ChainVersion, HosLease, VerifiedState, Violation,
+};
+use crate::wallet_request_decode::{EffectsSet, ShapeFact, TokenAmount};
+
+/// `(impl_version, decoder_version)` pairs this build can evaluate.
+///
+/// Versions below 6 are absent on purpose: their grants did not bound token
+/// movement on chain, so no lane we would open against them is acceptable.
+pub const DECODER_FOR_IMPL: &[(u32, u32)] = &[(6, 1)];
+
+/// The decoder that evaluates `impl_version`, or `None` when the version is
+/// unsupported (fail closed — the caller must refuse, not guess).
+pub fn decoder_for(impl_version: u32) -> Option<u32> {
+    DECODER_FOR_IMPL
+        .iter()
+        .find(|(impl_v, _)| *impl_v == impl_version)
+        .map(|(_, decoder)| *decoder)
+}
+
+/// `hos_agent_status(extension)` on the asset account — everything needed
+/// before signing, in one view call.
+///
+/// Every default is the value that FAILS verification: an absent
+/// `extension_enabled` reads as disabled, an absent `state` is not `"Active"`,
+/// an absent `frozen` is not `"Unfrozen"`, an absent lease is expired, an
+/// absent `impl_version` (0) is unsupported. A truncated or reshaped response
+/// therefore denies rather than permits.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentStatusView {
+    #[serde(default)]
+    pub extension_enabled: bool,
+    /// The spend grant, opaque here: identity checks do not read it, and the
+    /// decoder release will type it when something starts to.
+    #[serde(default)]
+    pub grant: Option<serde_json::Value>,
+    /// The contract's `OperatingState`: `Active` | `Listed` | `Settling` |
+    /// `Suspended` | `Parked`. Anything but `Active` blocks execution there
+    /// (`blocking_condition`), so anything but `Active` refuses here.
+    /// Note there is no `Expired` state — an ended lease shows up in
+    /// `lease_until_ns`, and `Frozen` is the separate field below.
+    #[serde(default)]
+    pub state: String,
+    /// The contract's `FreezeState`: `Unfrozen` | `SelfFrozen` |
+    /// `AuthorityFrozen`. Anything but `Unfrozen` means frozen.
+    #[serde(default)]
+    pub frozen: String,
+    /// Nanoseconds since epoch, as a decimal string (near-sdk `U64`).
+    #[serde(default = "zero_string")]
+    pub lease_until_ns: String,
+    /// Balance floor in yoctoNEAR, as a decimal string. Not an identity check —
+    /// carried for the spend pre-flight that reads the same view.
+    #[serde(default = "zero_string")]
+    pub reserve_yocto: String,
+    #[serde(default)]
+    pub impl_version: u32,
+}
+
+fn zero_string() -> String {
+    "0".to_string()
+}
+
+impl BindingProfile for HosLease {
+    const KIND: BindingKind = BindingKind::HosLease;
+    type ChainStatus = AgentStatusView;
+
+    /// Read `hos_agent_status` fail-closed. `Ok` means the executor's lane is
+    /// live RIGHT NOW: enabled, active, unfrozen, leased, on a supported
+    /// version. `now_ns` comes from the caller so the check stays pure
+    /// (reproducible vectors, no clock in this crate).
+    fn verify(status: &AgentStatusView, now_ns: u64) -> Result<VerifiedState, BindingFault> {
+        if !status.extension_enabled {
+            return Err(BindingFault::ExtensionDisabled);
+        }
+        if status.frozen != "Unfrozen" {
+            return Err(BindingFault::Frozen(status.frozen.clone()));
+        }
+        match status.state.as_str() {
+            "Active" => {}
+            "Expired" => return Err(BindingFault::StateExpired),
+            other => return Err(BindingFault::StateNotActive(other.to_string())),
+        }
+        let lease_until: u64 = status.lease_until_ns.parse().map_err(|_| {
+            BindingFault::Malformed(format!("lease_until_ns='{}'", status.lease_until_ns))
+        })?;
+        if lease_until <= now_ns {
+            return Err(BindingFault::LeaseExpired);
+        }
+        if decoder_for(status.impl_version).is_none() {
+            return Err(BindingFault::ImplVersionUnsupported(status.impl_version));
+        }
+        Ok(VerifiedState::HosLease {
+            status: status.clone(),
+        })
+    }
+
+    fn version_gate(version: &ChainVersion) -> Result<u32, BindingFault> {
+        match version {
+            ChainVersion::ImplVersion(v) => {
+                decoder_for(*v).ok_or(BindingFault::ImplVersionUnsupported(*v))
+            }
+            ChainVersion::CodeHash(_) => Err(BindingFault::EvidenceMismatch),
+        }
+    }
+
+    /// The leased mode's own layer over the decoded effects: the grant, the
+    /// call FORM and the balance reserve. Every rule here mirrors one the
+    /// wallet contract enforces on chain (`charge_spend` → `charge_promise`
+    /// → `charge_transfer` / `charge_token_call`, plus
+    /// `assert_within_reserve`) at `houseofstake/tla-contracts` tag
+    /// `valhalla-2026-08` (`5d22acf`) — verified against that source, not
+    /// against prose. Refusing here costs no gas and names the exact rule
+    /// instead of a panic string. Only ever ADDS refusals; the core's
+    /// mode-blind evaluation already ran.
+    ///
+    /// The reserve rule needs the account's balance, which is a separate
+    /// view, so it lives in [`HosLease::check_reserve`] and the caller that
+    /// has the balance runs it.
+    fn admission(fx: &EffectsSet, st: &VerifiedState, now_ns: u64) -> Vec<Violation> {
+        let status = match st {
+            VerifiedState::HosLease { status } => status,
+            VerifiedState::PersonalAccount { .. } => {
+                return vec![Violation {
+                    promise_index: None,
+                    rule: "evidence_mismatch",
+                    subcode: None,
+                    message: "the verified state belongs to personal_account, not the leased mode"
+                        .to_string(),
+                }]
+            }
+        };
+        let mut violations = Vec::new();
+
+        // The grant comes FIRST, and its absence or expiry answers alone —
+        // exactly the contract's order (`charge_spend` reads the grant and
+        // checks expiry once, before it looks at a single promise). Reporting
+        // a form rule while the real blocker is an expired grant would send
+        // the owner to fix the wrong thing.
+        let Some(grant_value) = &status.grant else {
+            return vec![Violation {
+                promise_index: None,
+                rule: "grant_missing",
+                subcode: None,
+                message: "the executor has no spend grant on this account".to_string(),
+            }];
+        };
+        let grant: SpendGrant = match serde_json::from_value(grant_value.clone()) {
+            Ok(g) => g,
+            Err(e) => {
+                return vec![Violation {
+                    promise_index: None,
+                    rule: "grant_unreadable",
+                    subcode: None,
+                    message: format!("the spend grant does not parse: {e}"),
+                }]
+            }
+        };
+        match grant.expires_at.parse::<u64>() {
+            Ok(expires_at) if expires_at > now_ns => {}
+            _ => {
+                return vec![Violation {
+                    promise_index: None,
+                    rule: "grant_expired",
+                    subcode: None,
+                    message: "the spend grant has expired (or its expiry is unreadable) — \
+                              the owner must issue a new grant"
+                        .to_string(),
+                }]
+            }
+        }
+
+        // The FORM a granted request must take. Each fact maps to the panic
+        // the contract would raise; they share one error class because a
+        // client reacts to all of them the same way (fix the request), and
+        // differ by subcode because the owner needs to know which rule.
+        //
+        // Note what is absent: several `transfer` actions in one promise.
+        // `charge_transfer` accepts any number of them — only a promise
+        // carrying a CALL must stand alone — so flagging a multi-transfer
+        // promise would refuse a request the chain would have executed.
+        for fact in &fx.shape_facts {
+            let (promise_index, subcode, message) = match fact {
+                ShapeFact::RefundToSet { promise_index } => (
+                    *promise_index,
+                    "refund_target_not_allowed",
+                    "a granted spend cannot redirect refunds".to_string(),
+                ),
+                ShapeFact::CallNotStandalone { promise_index } => (
+                    *promise_index,
+                    "grant_call_must_stand_alone",
+                    "a granted token call may carry no other action".to_string(),
+                ),
+                ShapeFact::CallDepositNotOneYocto { promise_index, deposit } => (
+                    *promise_index,
+                    "grant_call_deposit",
+                    format!("a granted token call attaches exactly one yocto, not {deposit}"),
+                ),
+                ShapeFact::NftApprovalIdSet { promise_index } => (
+                    *promise_index,
+                    "grant_approval_not_allowed",
+                    "a granted transfer cannot spend an approval".to_string(),
+                ),
+                ShapeFact::TokenArgsUnknownField { promise_index, field } => (
+                    *promise_index,
+                    "grant_args_unreadable",
+                    format!(
+                        "granted token call arguments are not readable: the contract refuses \
+                         the unknown field '{field}' (only `memo` may accompany the standard \
+                         arguments)"
+                    ),
+                ),
+            };
+            violations.push(Violation {
+                promise_index: Some(promise_index),
+                rule: "grant_shape_violation",
+                subcode: Some(subcode),
+                message,
+            });
+        }
+
+        // Methods a grant never covers, whatever the budget says.
+        //
+        // `charge_token_call` dispatches on the function name and panics on
+        // anything but `ft_transfer`/`nft_transfer` — `ft_transfer_call`,
+        // `nft_transfer_call`, `nft_approve`, a swap, anything. The core
+        // already refuses a call whose effects it cannot state, so today this
+        // would be unreachable; it is here so that it STAYS refused when an
+        // owner opt-in (`immediate_receiver_only`, plan item K6) starts
+        // letting named methods past the core. A profile may only add
+        // refusals, and this is the grant's own list, not a borrowed one.
+        for u in &fx.unknown_fund_moving {
+            let readable_method = u.method == "ft_transfer" || u.method == "nft_transfer";
+            violations.push(Violation {
+                promise_index: Some(u.promise_index),
+                rule: "grant_shape_violation",
+                subcode: Some(if readable_method {
+                    // The right method, arguments the contract cannot parse.
+                    "grant_args_unreadable"
+                } else {
+                    "grant_method_not_allowed"
+                }),
+                message: if readable_method {
+                    format!(
+                        "granted token call arguments are not readable: {} ({})",
+                        u.method, u.reason
+                    )
+                } else {
+                    format!(
+                        "a spend grant covers ft_transfer and nft_transfer only, never \
+                         '{}' on '{}'",
+                        u.method, u.contract
+                    )
+                },
+            });
+        }
+
+        // Actions a grant never covers.
+        for s in &fx.storage_registrations {
+            violations.push(Violation {
+                promise_index: Some(s.promise_index),
+                rule: "grant_shape_violation",
+                subcode: Some("grant_method_not_allowed"),
+                message: "a spend grant covers ft_transfer and nft_transfer only, because \
+                          nothing else states what it moves (storage_deposit is a \
+                          personal_account-mode operation)"
+                    .to_string(),
+            });
+        }
+        for promise_index in &fx.state_inits {
+            violations.push(Violation {
+                promise_index: Some(*promise_index),
+                rule: "grant_shape_violation",
+                subcode: Some("grant_action_not_allowed"),
+                message: "a spend grant covers plain transfers and allowlisted token calls \
+                          only, never deploying code"
+                    .to_string(),
+            });
+        }
+
+        // Native ceiling. Charged ONLY for promises without a function call:
+        // the contract's `charge_transfer` handles those, while a token
+        // call's mandated yocto is "protocol overhead rather than spend" and
+        // is deliberately left out of the NEAR budget (its own words). Adding
+        // it here would refuse a request a yocto short of the ceiling that
+        // the chain would have accepted.
+        let budget = grant.budget_yocto.parse::<u128>().unwrap_or(0);
+        let spent = grant.spent_yocto.parse::<u128>().unwrap_or(u128::MAX);
+        let native_charged: u128 = fx
+            .native_per_promise
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !fx.call_promises.contains(i))
+            .map(|(_, amount)| *amount)
+            .fold(0u128, |acc, amount| acc.saturating_add(amount));
+        if native_charged > budget.saturating_sub(spent) {
+            violations.push(Violation {
+                promise_index: None,
+                rule: "grant_exhausted",
+                subcode: None,
+                message: format!(
+                    "spend exceeds the granted cap: {} > {} remaining (budget {budget}, \
+                     spent {spent}); re-granting raises the ceiling, revoking resets the meter",
+                    native_charged,
+                    budget.saturating_sub(spent)
+                ),
+            });
+        }
+
+        // Destinations. The grant's `receivers` are read differently per
+        // action, exactly as the contract reads them: a plain transfer is
+        // checked against the PROMISE's receiver, a token call against the
+        // recipient decoded from its arguments. Checking the promise receiver
+        // for a token call would demand the token CONTRACT be granted, which
+        // it never is.
+        let permitted = |dest: &str| grant.receivers.iter().any(|r| r == dest);
+        for (promise_index, receiver) in fx.receivers.iter().enumerate() {
+            // A promise that also carries a call is checked by its arguments
+            // below; the contract never reaches its transfer arm for one.
+            // Every OTHER promise is checked, whatever it carries — including
+            // one with no actions at all, which `charge_transfer` still
+            // refuses when the receiver is not granted.
+            if fx.call_promises.contains(&promise_index) {
+                continue;
+            }
+            if !permitted(receiver) {
+                violations.push(Violation {
+                    promise_index: Some(promise_index),
+                    rule: "receiver_not_granted",
+                    subcode: None,
+                    message: format!("receiver '{receiver}' is not in the spend grant"),
+                });
+            }
+        }
+        for m in &fx.token_moves {
+            if !permitted(&m.recipient) {
+                violations.push(Violation {
+                    promise_index: Some(m.promise_index),
+                    rule: "receiver_not_granted",
+                    subcode: None,
+                    message: format!("receiver '{}' is not in the spend grant", m.recipient),
+                });
+            }
+            match &m.amount {
+                // Fungible tokens are METERED in their own units.
+                TokenAmount::Fungible(amount) => match grant.tokens.get(&m.token) {
+                    None => violations.push(Violation {
+                        promise_index: Some(m.promise_index),
+                        rule: "token_not_granted",
+                        subcode: None,
+                        message: format!("token '{}' is not in the spend grant", m.token),
+                    }),
+                    Some(budget) => {
+                        let cap = budget.budget.parse::<u128>().unwrap_or(0);
+                        let used = budget.spent.parse::<u128>().unwrap_or(u128::MAX);
+                        if *amount > cap.saturating_sub(used) {
+                            violations.push(Violation {
+                                promise_index: Some(m.promise_index),
+                                rule: "token_budget_exceeded",
+                                subcode: None,
+                                message: format!(
+                                    "spend exceeds the granted cap for '{}': {amount} > {} remaining",
+                                    m.token,
+                                    cap.saturating_sub(used)
+                                ),
+                            });
+                        }
+                    }
+                },
+                // Non-fungible items are FENCED, never metered: there is no
+                // quantity to count, so the grant names the exact token_ids
+                // that may leave and no budget is debited. Charging one here
+                // would invent a rule the chain does not have.
+                TokenAmount::Item(token_id) => {
+                    let fenced = grant
+                        .items
+                        .get(&m.token)
+                        .map(|ids| ids.iter().any(|id| id == token_id))
+                        .unwrap_or(false);
+                    if !fenced {
+                        violations.push(Violation {
+                            promise_index: Some(m.promise_index),
+                            rule: "item_not_granted",
+                            subcode: None,
+                            message: format!(
+                                "item '{token_id}' of '{}' is not in the spend grant",
+                                m.token
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+}
+
+impl HosLease {
+    /// The account's own collection is off limits to a grant — checked
+    /// separately because `collection_id` lives in `nft_item_info()`, not in
+    /// `hos_agent_status`, so only a caller holding that second view can run
+    /// it.
+    ///
+    /// Mirrors the guard at the top of `charge_token_call`: a granted CALL may
+    /// not be addressed to the collection this account belongs to, whatever
+    /// the grant says. The contract refuses at grant time too
+    /// (`assert_grantable`), but this is the spend-time half — its own tests
+    /// (`the_registry_is_refused_at_spend_time_on_the_token_path_too`) exist
+    /// precisely because a grant written before a migration could still name
+    /// it. Without this, the registry call passes our pre-flight and burns gas
+    /// on a certain panic.
+    pub fn check_own_collection(fx: &EffectsSet, collection_id: &str) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        for promise_index in &fx.call_promises {
+            let Some(receiver) = fx.receivers.get(*promise_index) else {
+                continue;
+            };
+            if receiver == collection_id {
+                violations.push(Violation {
+                    promise_index: Some(*promise_index),
+                    rule: "own_collection_refused",
+                    subcode: None,
+                    message: format!(
+                        "'{receiver}' is the collection this account itself belongs to; a spend \
+                         grant can never move this account's own names"
+                    ),
+                });
+            }
+        }
+        violations
+    }
+
+    /// The balance floor, checked separately because it needs the asset
+    /// account's balance (a second view) on top of the status.
+    ///
+    /// Mirrors `assert_within_reserve`: the sum of ALL promise deposits —
+    /// token calls' mandated yocto included, unlike the grant's native
+    /// budget — must leave the account at or above `reserve_yocto`, which
+    /// tracks live storage usage and therefore cannot be derived off chain.
+    pub fn check_reserve(
+        fx: &EffectsSet,
+        status: &AgentStatusView,
+        account_balance_yocto: u128,
+    ) -> Option<Violation> {
+        let reserve = status.reserve_yocto.parse::<u128>().unwrap_or(u128::MAX);
+        if account_balance_yocto.saturating_sub(fx.native_total) < reserve {
+            return Some(Violation {
+                promise_index: None,
+                rule: "insufficient_vs_reserve",
+                subcode: None,
+                message: format!(
+                    "spending {} would leave the account below its reserve floor of {reserve} \
+                     (balance {account_balance_yocto}); the floor tracks live storage usage",
+                    fx.native_total
+                ),
+            });
+        }
+        None
+    }
+}
+
+/// The v6 on-chain grant, as `hos_agent_status` reports it. Missing fields
+/// default to the EMPTY grant (no receivers, no tokens, zero budget) — a
+/// shrunken answer can only refuse more, never less.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SpendGrant {
+    #[serde(default)]
+    pub receivers: Vec<String>,
+    #[serde(default = "zero_string")]
+    pub budget_yocto: String,
+    #[serde(default = "zero_string")]
+    pub spent_yocto: String,
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, TokenBudget>,
+    #[serde(default)]
+    pub items: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default = "zero_string")]
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TokenBudget {
+    #[serde(default = "zero_string")]
+    pub budget: String,
+    #[serde(default = "zero_string")]
+    pub spent: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verify(s: &AgentStatusView, now_ns: u64) -> Result<VerifiedState, BindingFault> {
+        HosLease::verify(s, now_ns)
+    }
+
+    fn healthy() -> AgentStatusView {
+        AgentStatusView {
+            extension_enabled: true,
+            grant: None,
+            state: "Active".into(),
+            frozen: "Unfrozen".into(),
+            lease_until_ns: "2000".into(),
+            reserve_yocto: "0".into(),
+            impl_version: 6,
+        }
+    }
+
+    #[test]
+    fn a_healthy_status_passes_and_each_fault_is_named() {
+        assert!(matches!(
+            verify(&healthy(), 1000),
+            Ok(VerifiedState::HosLease { .. })
+        ));
+
+        let mut s = healthy();
+        s.extension_enabled = false;
+        assert_eq!(verify(&s, 1000), Err(BindingFault::ExtensionDisabled));
+
+        let mut s = healthy();
+        s.frozen = "Frozen".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::Frozen("Frozen".into())));
+
+        let mut s = healthy();
+        s.state = "Parked".into();
+        assert_eq!(
+            verify(&s, 1000),
+            Err(BindingFault::StateNotActive("Parked".into()))
+        );
+
+        let mut s = healthy();
+        s.state = "Expired".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::StateExpired));
+
+        let mut s = healthy();
+        s.lease_until_ns = "999".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::LeaseExpired));
+
+        let mut s = healthy();
+        s.impl_version = 5;
+        assert_eq!(
+            verify(&s, 1000),
+            Err(BindingFault::ImplVersionUnsupported(5))
+        );
+    }
+
+    #[test]
+    fn a_lease_ending_now_is_already_over() {
+        // `<=` not `<`: at the boundary nanosecond the lease is NOT live. An
+        // off-by-one here signs against a reclaimable account.
+        let mut s = healthy();
+        s.lease_until_ns = "1000".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::LeaseExpired));
+    }
+
+    #[test]
+    fn an_empty_response_fails_on_its_first_missing_field() {
+        // serde defaults are the unhealthy values, so `{}` must deny.
+        let s: AgentStatusView = serde_json::from_str("{}").unwrap();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::ExtensionDisabled));
+    }
+
+    #[test]
+    fn an_unreadable_lease_is_malformed_not_expired() {
+        let mut s = healthy();
+        s.lease_until_ns = "soon".into();
+        assert!(matches!(verify(&s, 1000), Err(BindingFault::Malformed(_))));
+    }
+
+    #[test]
+    fn the_method_list_example_parses_and_passes() {
+        // The exact shape the partner's method list shows for hos_agent_status.
+        let json = r#"{
+          "extension_enabled": true,
+          "grant": {
+            "receivers": ["bob.near"],
+            "budget_yocto": "5000000000000000000000000",
+            "spent_yocto": "0",
+            "tokens": { "token.near": { "budget": "1000000000", "spent": "0" } },
+            "items": { "collection.near": ["1041", "1055"] },
+            "expires_at": "1786000000000000000"
+          },
+          "state": "Active",
+          "frozen": "Unfrozen",
+          "lease_until_ns": "1790000000000000000",
+          "reserve_yocto": "3140000000000000000000000",
+          "impl_version": 6
+        }"#;
+        let s: AgentStatusView = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            verify(&s, 1_789_999_999_999_999_999),
+            Ok(VerifiedState::HosLease { .. })
+        ));
+        assert_eq!(
+            verify(&s, 1_790_000_000_000_000_000),
+            Err(BindingFault::LeaseExpired)
+        );
+    }
+
+    fn fx_from(request_json: &str) -> EffectsSet {
+        let envelope = crate::wallet_request_decode::decode(request_json.as_bytes()).unwrap();
+        crate::wallet_request_decode::effects(&envelope, request_json.len()).unwrap()
+    }
+
+    fn granted_state(grant: serde_json::Value) -> VerifiedState {
+        let mut status = healthy();
+        status.grant = Some(grant);
+        VerifiedState::HosLease { status }
+    }
+
+    /// The error CLASSES a set of violations carries, in order.
+    fn rules(v: &[Violation]) -> Vec<&'static str> {
+        v.iter().map(|x| x.rule).collect()
+    }
+
+    /// The subcodes, for the class that has them.
+    fn subcodes(v: &[Violation]) -> Vec<&'static str> {
+        v.iter().filter_map(|x| x.subcode).collect()
+    }
+
+    #[test]
+    fn admission_enforces_the_granted_call_form() {
+        // The spec's own illustration: refund_to set, ft_transfer bundled
+        // with a plain transfer. The contract rejects it two ways; admission
+        // names both before any gas is burned, under ONE class with distinct
+        // subcodes.
+        let ft = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(r#"{"receiver_id":"bob.near","amount":"10"}"#)
+        };
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "refund_to":"attacker.near",
+                "actions":[
+                  {{"action":"function_call","payload":{{
+                     "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}},
+                  {{"action":"transfer","payload":{{"amount":"250"}}}}
+                ]}}]}}}}"#
+        ));
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near", "token.near"],
+            "budget_yocto": "1000000", "spent_yocto": "0",
+            "tokens": { "token.near": { "budget": "100", "spent": "0" } },
+            "items": {}, "expires_at": "2000"
+        }));
+
+        let violations = HosLease::admission(&fx, &st, 1000);
+        let subs = subcodes(&violations);
+        assert!(subs.contains(&"refund_target_not_allowed"), "{violations:?}");
+        assert!(subs.contains(&"grant_call_must_stand_alone"), "{violations:?}");
+        assert!(
+            rules(&violations).iter().all(|r| *r == "grant_shape_violation"),
+            "form refusals share one class: {violations:?}"
+        );
+
+        // The SAME effects under the personal profile: zero violations — the
+        // form is legal there, and this asymmetry is the differential subject.
+        let personal = crate::binding::PersonalAccount::admission(
+            &fx,
+            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_CODE_HASHES[0] },
+            1000,
+        );
+        assert!(personal.is_empty(), "{personal:?}");
+    }
+
+    #[test]
+    fn several_transfers_in_one_promise_are_legal_under_a_grant() {
+        // `charge_transfer` accepts any number of Transfer actions — only a
+        // promise carrying a CALL must stand alone. Treating a multi-transfer
+        // promise as malformed would refuse a request the chain executes.
+        let fx = fx_from(
+            r#"{"request":{"external":[{
+                "receiver_id":"bob.near",
+                "actions":[
+                    {"action":"transfer","payload":{"amount":"10"}},
+                    {"action":"transfer","payload":{"amount":"20"}},
+                    {"action":"transfer","payload":{"amount":"30"}}]}]}}"#,
+        );
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "1000", "spent_yocto": "0",
+            "expires_at": "2000"
+        }));
+        assert!(HosLease::admission(&fx, &st, 1000).is_empty());
+        // ...and the whole promise is metered, all three actions together.
+        let tight = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "59", "spent_yocto": "0",
+            "expires_at": "2000"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &tight, 1000)), vec!["grant_exhausted"]);
+    }
+
+    #[test]
+    fn a_token_calls_mandated_yocto_is_not_charged_to_the_native_budget() {
+        // The contract calls it "protocol overhead rather than spend" and
+        // leaves it out of the NEAR budget. Counting it would refuse a
+        // request one yocto short of the ceiling that the chain accepts.
+        use base64::Engine;
+        let ft = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"bob.near","amount":"5"}"#);
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"usdc.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        // Native budget fully spent: a token call must still pass, because it
+        // charges the TOKEN budget only.
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near"],
+            "budget_yocto": "100", "spent_yocto": "100",
+            "tokens": { "usdc.near": { "budget": "10", "spent": "0" } },
+            "expires_at": "2000"
+        }));
+        assert!(HosLease::admission(&fx, &st, 1000).is_empty());
+    }
+
+    #[test]
+    fn admission_meters_the_grant() {
+        let transfer = r#"{"request":{"external":[{
+            "receiver_id":"bob.near",
+            "actions":[{"action":"transfer","payload":{"amount":"600"}}]}]}}"#;
+        let fx = fx_from(transfer);
+
+        // Missing grant: answers ALONE, like the contract, which reads the
+        // grant before it looks at a promise.
+        let no_grant = VerifiedState::HosLease { status: healthy() };
+        assert_eq!(rules(&HosLease::admission(&fx, &no_grant, 1000)), vec!["grant_missing"]);
+
+        // Expired grant.
+        let expired = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "1000", "spent_yocto": "0",
+            "expires_at": "999"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &expired, 1000)), vec!["grant_expired"]);
+
+        // Budget minus spent is the ceiling: 600 > 1000-500.
+        let tight = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "1000", "spent_yocto": "500",
+            "expires_at": "2000"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &tight, 1000)), vec!["grant_exhausted"]);
+
+        // Receiver outside the grant: for a plain transfer that is the
+        // PROMISE's receiver.
+        let wrong_receiver = granted_state(serde_json::json!({
+            "receivers": ["carol.near"], "budget_yocto": "1000000", "spent_yocto": "0",
+            "expires_at": "2000"
+        }));
+        assert_eq!(
+            rules(&HosLease::admission(&fx, &wrong_receiver, 1000)),
+            vec!["receiver_not_granted"]
+        );
+    }
+
+    #[test]
+    fn an_expired_grant_is_reported_before_any_form_rule() {
+        // A malformed request against an expired grant must say "expired":
+        // the owner has to re-grant, not rewrite the call. The contract fails
+        // in that order too.
+        let fx = fx_from(
+            r#"{"request":{"external":[{
+                "receiver_id":"bob.near",
+                "refund_to":"attacker.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        let expired = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "1000", "spent_yocto": "0",
+            "expires_at": "999"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &expired, 1000)), vec!["grant_expired"]);
+    }
+
+    #[test]
+    fn admission_meters_tokens_in_their_own_units_and_fences_items() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+        // 60 USDC against a 50-remaining token budget: refused by the TOKEN
+        // cap; the huge native budget is irrelevant (different units).
+        let ft = b64(r#"{"receiver_id":"bob.near","amount":"60"}"#);
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"usdc.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near"],
+            "budget_yocto": "99999999999999999999", "spent_yocto": "0",
+            "tokens": { "usdc.near": { "budget": "100", "spent": "50" } },
+            "expires_at": "2000"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &st, 1000)), vec!["token_budget_exceeded"]);
+
+        // A token with no entry at all.
+        let st_none = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "99999999999999999999",
+            "spent_yocto": "0", "tokens": {}, "expires_at": "2000"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx, &st_none, 1000)), vec!["token_not_granted"]);
+
+        // An NFT outside the fence: token_id 9999 when only 1041 may leave.
+        let nft = b64(r#"{"receiver_id":"bob.near","token_id":"9999"}"#);
+        let fx_nft = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"col.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"nft_transfer","args":"{nft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        let st_items = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "99999999999999999999",
+            "spent_yocto": "0", "items": { "col.near": ["1041"] }, "expires_at": "2000"
+        }));
+        assert_eq!(rules(&HosLease::admission(&fx_nft, &st_items, 1000)), vec!["item_not_granted"]);
+
+        // A FENCED item passes with NO token budget for that collection at
+        // all: NFTs are fenced, never metered. Requiring a budget here would
+        // refuse every legal NFT transfer.
+        let ok_nft = b64(r#"{"receiver_id":"bob.near","token_id":"1041"}"#);
+        let fx_ok = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"col.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"nft_transfer","args":"{ok_nft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        assert!(HosLease::admission(&fx_ok, &st_items, 1000).is_empty());
+    }
+
+    #[test]
+    fn memo_is_permitted_but_any_other_extra_argument_is_not() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near"],
+            "budget_yocto": "1000", "spent_yocto": "0",
+            "tokens": { "usdc.near": { "budget": "1000", "spent": "0" } },
+            "expires_at": "2000"
+        }));
+        let call = |args: &str| {
+            fx_from(&format!(
+                r#"{{"request":{{"external":[{{
+                    "receiver_id":"usdc.near",
+                    "actions":[{{"action":"function_call","payload":{{
+                        "function_name":"ft_transfer","args":"{}","deposit":"1"}}}}]}}]}}}}"#,
+                b64(args)
+            ))
+        };
+
+        // `memo` is declared by the standard and by the contract: legal.
+        let with_memo = call(r#"{"receiver_id":"bob.near","amount":"5","memo":"rent"}"#);
+        assert!(HosLease::admission(&with_memo, &st, 1000).is_empty());
+
+        // `msg` is the ft_transfer_call field. The contract parses these
+        // arguments with deny_unknown_fields, so it cannot read them at all —
+        // refuse here rather than pay gas for a panic.
+        let with_msg = call(r#"{"receiver_id":"bob.near","amount":"5","msg":"x"}"#);
+        let v = HosLease::admission(&with_msg, &st, 1000);
+        assert_eq!(rules(&v), vec!["grant_shape_violation"]);
+        assert_eq!(subcodes(&v), vec!["grant_args_unreadable"]);
+
+        // The personal mode reads the same call and refuses nothing: its
+        // contract never parses these arguments.
+        let personal = crate::binding::PersonalAccount::admission(
+            &with_msg,
+            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_CODE_HASHES[0] },
+            1000,
+        );
+        assert!(personal.is_empty(), "{personal:?}");
+    }
+
+    #[test]
+    fn admission_refuses_methods_the_grant_never_covers() {
+        // storage_deposit is a personal_account operation; state_init deploys
+        // code. Both are structurally outside a grant, whatever the budget.
+        use base64::Engine;
+        let sd = base64::engine::general_purpose::STANDARD.encode(r#"{"account_id":"bob.near"}"#);
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[
+                {{"receiver_id":"usdc.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"storage_deposit","args":"{sd}","deposit":"1"}}}}]}},
+                {{"receiver_id":"new.near","actions":[{{"action":"deterministic_state_init","payload":{{
+                    "state_init":{{}},"deposit":"1"}}}}]}}
+            ]}}}}"#
+        ));
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near", "usdc.near", "new.near"],
+            "budget_yocto": "99999999999999999999", "spent_yocto": "0",
+            "expires_at": "2000"
+        }));
+        let v = HosLease::admission(&fx, &st, 1000);
+        let subs = subcodes(&v);
+        assert!(subs.contains(&"grant_method_not_allowed"), "{v:?}");
+        assert!(subs.contains(&"grant_action_not_allowed"), "{v:?}");
+    }
+
+    #[test]
+    fn a_promise_carrying_nothing_still_faces_the_receivers_list() {
+        // `charge_transfer` checks the receiver BEFORE it looks at the
+        // actions, so a promise with none at all is refused when the receiver
+        // is not granted. Metering only the promises that move something would
+        // pass it and pay gas for the panic.
+        let fx = fx_from(
+            r#"{"request":{"external":[{"receiver_id":"stranger.near","actions":[]}]}}"#,
+        );
+        let st = granted_state(serde_json::json!({
+            "receivers": ["bob.near"], "budget_yocto": "1000", "spent_yocto": "0",
+            "expires_at": "2000"
+        }));
+        assert_eq!(
+            rules(&HosLease::admission(&fx, &st, 1000)),
+            vec!["receiver_not_granted"]
+        );
+    }
+
+    #[test]
+    fn the_accounts_own_collection_is_refused_at_spend_time() {
+        // `charge_token_call` refuses a call addressed to the collection this
+        // account belongs to — the registry that holds its own name — before
+        // it even looks at the method. The grant cannot legally name it, but a
+        // grant written before a migration still can, which is why the
+        // contract keeps a spend-time test of its own.
+        use base64::Engine;
+        let args = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"bob.near","token_id":"agent.tla"}"#);
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"tla.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"nft_transfer","args":"{args}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+
+        let v = HosLease::check_own_collection(&fx, "tla.near");
+        assert_eq!(rules(&v), vec!["own_collection_refused"]);
+        assert_eq!(v[0].promise_index, Some(0));
+
+        // Any OTHER collection is none of this rule's business.
+        assert!(HosLease::check_own_collection(&fx, "other.near").is_empty());
+
+        // And a plain transfer to the collection is not a token call — the
+        // contract's guard sits inside `charge_token_call` only.
+        let plain = fx_from(
+            r#"{"request":{"external":[{
+                "receiver_id":"tla.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        assert!(HosLease::check_own_collection(&plain, "tla.near").is_empty());
+    }
+
+    #[test]
+    fn the_reserve_floor_is_checked_against_the_whole_request() {
+        // `assert_within_reserve` sums EVERY promise's deposits — a token
+        // call's yocto included, unlike the grant's native budget — and the
+        // remainder must stay at or above the floor.
+        let fx = fx_from(
+            r#"{"request":{"external":[{
+                "receiver_id":"bob.near",
+                "actions":[{"action":"transfer","payload":{"amount":"60"}}]}]}}"#,
+        );
+        let mut status = healthy();
+        status.reserve_yocto = "50".into();
+
+        // 100 - 60 = 40 < 50 → refused.
+        let v = HosLease::check_reserve(&fx, &status, 100).expect("must refuse");
+        assert_eq!(v.rule, "insufficient_vs_reserve");
+        // 120 - 60 = 60 ≥ 50 → allowed.
+        assert!(HosLease::check_reserve(&fx, &status, 120).is_none());
+        // Exactly at the floor is allowed (the contract uses `>=`).
+        assert!(HosLease::check_reserve(&fx, &status, 110).is_none());
+        // An unreadable floor refuses rather than assuming zero.
+        status.reserve_yocto = "lots".into();
+        assert!(HosLease::check_reserve(&fx, &status, u128::MAX).is_some());
+    }
+
+    #[test]
+    fn the_registry_supports_exactly_version_six() {
+        assert_eq!(decoder_for(6), Some(1));
+        assert_eq!(decoder_for(5), None);
+        assert_eq!(decoder_for(0), None);
+        assert_eq!(decoder_for(7), None);
+    }
+}
+
+#[cfg(test)]
+mod answers_alone_tests {
+    use super::*;
+    use crate::binding::{BindingProfile, HosLease, PersonalAccount, VerifiedState};
+
+    fn some_promise() -> EffectsSet {
+        let json = r#"{"request":{"external":[{"receiver_id":"carol.testnet",
+            "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#;
+        let envelope = crate::wallet_request_decode::decode(json.as_bytes()).unwrap();
+        crate::wallet_request_decode::effects(&envelope, json.len()).unwrap()
+    }
+
+    fn status_with(grant: Option<serde_json::Value>) -> AgentStatusView {
+        AgentStatusView {
+            extension_enabled: true,
+            grant,
+            state: "Active".into(),
+            frozen: "Unfrozen".into(),
+            lease_until_ns: "9000000000000000000".into(),
+            reserve_yocto: "0".into(),
+            impl_version: 6,
+        }
+    }
+
+    /// Every way `admission` can stop BEFORE looking at a promise must say so
+    /// through `answers_alone`.
+    ///
+    /// The caller relies on this to decide whether to prepend the
+    /// own-collection rule, which describes a stage the request never reached.
+    /// A fifth early return added without a word here would silently start
+    /// reporting a promise rule for a request the chain refused at the door.
+    #[test]
+    fn every_early_return_answers_alone() {
+        let fx = some_promise();
+        let cases: Vec<(&str, Vec<Violation>)> = vec![
+            (
+                "evidence of the wrong mode",
+                HosLease::admission(
+                    &fx,
+                    &VerifiedState::PersonalAccount { code_hash: [0; 32] },
+                    0,
+                ),
+            ),
+            (
+                "no grant at all",
+                HosLease::admission(
+                    &fx,
+                    &VerifiedState::HosLease { status: status_with(None) },
+                    0,
+                ),
+            ),
+            (
+                "a grant that does not parse",
+                HosLease::admission(
+                    &fx,
+                    &VerifiedState::HosLease {
+                        status: status_with(Some(serde_json::json!("not an object"))),
+                    },
+                    0,
+                ),
+            ),
+            (
+                "a grant past its expiry",
+                HosLease::admission(
+                    &fx,
+                    &VerifiedState::HosLease {
+                        status: status_with(Some(serde_json::json!({
+                            "receivers": ["carol.testnet"],
+                            "budget_yocto": "1000",
+                            "spent_yocto": "0",
+                            "expires_at": "1"
+                        }))),
+                    },
+                    1_000_000,
+                ),
+            ),
+            (
+                "the personal profile handed leased evidence",
+                PersonalAccount::admission(
+                    &fx,
+                    &VerifiedState::HosLease { status: status_with(None) },
+                    0,
+                ),
+            ),
+        ];
+
+        for (what, violations) in cases {
+            assert_eq!(violations.len(), 1, "{what}: an early return answers alone");
+            assert!(
+                violations[0].answers_alone(),
+                "{what}: rule '{}' stops admission before any promise, but does not say so",
+                violations[0].rule
+            );
+        }
+    }
+
+    /// The other direction, and the one that would fail QUIETLY: a
+    /// promise-level rule must NOT claim to answer alone, or the caller would
+    /// drop the own-collection refusal it was supposed to report first.
+    #[test]
+    fn promise_level_rules_do_not_answer_alone() {
+        for rule in [
+            "grant_exhausted",
+            "grant_shape_violation",
+            "receiver_not_granted",
+            "token_not_granted",
+            "token_budget_exceeded",
+            "item_not_granted",
+            "own_collection_refused",
+            "insufficient_vs_reserve",
+        ] {
+            let v = Violation {
+                promise_index: Some(0),
+                rule,
+                subcode: None,
+                message: String::new(),
+            };
+            assert!(
+                !v.answers_alone(),
+                "'{rule}' is decided while charging promises; treating it as a door rule would \
+                 swallow the rules that belong beside it"
+            );
+        }
+    }
+}

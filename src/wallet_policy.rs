@@ -796,6 +796,29 @@ fn evaluate_section(
         return Decision::Allow;
     }
 
+    // 2b. `w_execute_extension` (defuse-wallet's extension door) — DECODE, then
+    //     evaluate the DECODED effects. The outer fields of such a call describe
+    //     nothing: `to` is the agent's own wallet-contract account, the deposit
+    //     is a required 1-yocto marker, and the real recipients and amounts are
+    //     nested inside `args_base64`. So the rules below would otherwise meter
+    //     the marker instead of the economic action. Triggered by the METHOD
+    //     NAME (part of the signed canonical op — no caller layer can relabel
+    //     it), for EVERY account, bound or not: a binding flag would be an
+    //     off-switch for whoever supplies flags. Anything that cannot be
+    //     decoded and stated is a terminal Deny — before the multisig trigger,
+    //     because an approver reading the outer fields would approve blind.
+    //     On a pass, the op continues through the standard gates below (the
+    //     outer `to` still faces the whitelist, the type gate, the approval
+    //     trigger); mode-specific FORM rules are not here — they live in the
+    //     binding profiles' admission, this engine is mode-blind.
+    if let Op::Call { method, args_base64, .. } = op {
+        if method == "w_execute_extension" {
+            if let Some(decision) = evaluate_extension_call(rules, args_base64, usage) {
+                return decision;
+            }
+        }
+    }
+
     // 3. transaction_types (STATELESS). Deployed policies may list the legacy
     //    deposit-family types (`intents_deposit`/`storage_deposit`/`cross_chain_deposit`),
     //    which all collapse to `call` (plan §2c) — normalize them on the POLICY side so
@@ -963,6 +986,181 @@ fn evaluate_section(
 
 fn deny(reason: String) -> Decision {
     Decision::Deny { reason }
+}
+
+/// Core evaluation of a `w_execute_extension` call: decode the nested request
+/// and hold its DECODED effects against the owner's rules. `Some(decision)`
+/// is terminal; `None` means every effect passed and the op continues through
+/// the standard pipeline.
+///
+/// Mode-blind on purpose (see the guard test in `binding.rs`): everything
+/// here is a rule ANY mode must enforce — account-control ops, unstatable
+/// calls, the owner's address/token/limit rules over what actually moves.
+/// Mode-specific FORM rules (standalone/1-yocto/refund_to) are the binding
+/// profiles' admission, not this engine.
+fn evaluate_extension_call(
+    rules: Option<&Rules>,
+    args_base64: &str,
+    usage: Option<&Usage>,
+) -> Option<Decision> {
+    use crate::wallet_request_decode::{decode, effects, TokenAmount};
+    use base64::Engine;
+
+    let raw = match base64::engine::general_purpose::STANDARD.decode(args_base64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Some(deny(format!(
+                "w_execute_extension args are not valid base64: {e}"
+            )))
+        }
+    };
+    let envelope = match decode(&raw) {
+        Ok(v) => v,
+        Err(e) => return Some(deny(e.to_string())),
+    };
+    let fx = match effects(&envelope, raw.len()) {
+        Ok(v) => v,
+        Err(e) => return Some(deny(e.to_string())),
+    };
+
+    // R4: internal operations are account CONTROL (AddExtension grants a
+    // stranger the whole lane) — hard deny, no capability can opt in.
+    if fx.has_internal {
+        return Some(deny(format!(
+            "w_execute_extension carries internal account-control operations ({}) — \
+             this lane only spends, it never rewires the account",
+            fx.internal_ops.join(", ")
+        )));
+    }
+
+    // Fail closed on anything whose effects cannot be stated: a call no rule
+    // could read could move value no rule counted.
+    if let Some(u) = fx.unknown_fund_moving.first() {
+        return Some(deny(format!(
+            "promise {}: cannot state the effects of {}.{} ({})",
+            u.promise_index, u.contract, u.method, u.reason
+        )));
+    }
+
+    // Address rules over every account the request touches: immediate
+    // receivers, refund destinations (they get failed deposits), the LOGICAL
+    // recipients of token moves (R3: permitting token.near says nothing about
+    // bob.near), and storage-registration beneficiaries.
+    if let Some(addresses) = rules.and_then(|r| r.addresses.as_ref()) {
+        let allowed = |dest: &str| -> bool {
+            match addresses.mode.as_deref().unwrap_or("whitelist") {
+                "whitelist" => addresses.list.iter().any(|a| a == dest),
+                "blacklist" => !addresses.list.iter().any(|a| a == dest),
+                _ => true,
+            }
+        };
+        let mut touched: Vec<(usize, &str, &str)> = Vec::new();
+        for (i, r) in fx.receivers.iter().enumerate() {
+            touched.push((i, "receiver", r));
+        }
+        for (promise_index, r) in &fx.refund_tos {
+            touched.push((*promise_index, "refund_to", r));
+        }
+        for m in &fx.token_moves {
+            touched.push((m.promise_index, "token recipient", &m.recipient));
+        }
+
+        for s in &fx.storage_registrations {
+            if let Some(account) = &s.account {
+                touched.push((s.promise_index, "storage beneficiary", account));
+            }
+        }
+        for (promise_index, role, dest) in touched {
+            if !allowed(dest) {
+                return Some(deny(format!(
+                    "promise {promise_index}: {role} '{dest}' is not permitted by the address rules"
+                )));
+            }
+        }
+    }
+
+    // Token allowlist: a moved token is a token, whatever the outer op said.
+    if let Some(allowed) = rules.and_then(|r| r.allowed_tokens.as_ref()) {
+        if !allowed.iter().any(|t| t == "*") {
+            for m in &fx.token_moves {
+                if !allowed.iter().any(|t| t == &m.token) {
+                    return Some(deny(format!(
+                        "promise {}: token '{}' is not allowed by policy",
+                        m.promise_index, m.token
+                    )));
+                }
+            }
+        }
+    }
+
+    // Per-token fungible totals across the WHOLE request (R2 aggregate:
+    // splitting a payment must not split the rule that meters it).
+    let mut token_totals: std::collections::BTreeMap<&str, u128> = std::collections::BTreeMap::new();
+    for m in &fx.token_moves {
+        if let TokenAmount::Fungible(amount) = m.amount {
+            let entry = token_totals.entry(m.token.as_str()).or_insert(0);
+            *entry = entry.saturating_add(amount);
+        }
+    }
+
+    if let Some(limits) = rules.and_then(|r| r.limits.as_ref()) {
+        // Per-transaction caps: native first, then each moved token in its
+        // own units.
+        if let Some(per_tx) = limits.per_transaction.as_ref() {
+            if let Some(limit) = lookup_limit(per_tx, "native") {
+                if fx.native_total > limit {
+                    return Some(deny(format!(
+                        "Per-transaction limit exceeded for native: {} > {} (decoded total)",
+                        fx.native_total, limit
+                    )));
+                }
+            }
+            for (token, total) in &token_totals {
+                if let Some(limit) = lookup_limit(per_tx, token) {
+                    if *total > limit {
+                        return Some(deny(format!(
+                            "Per-transaction limit exceeded for {token}: {total} > {limit} (decoded total)"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Velocity windows (STATEFUL — coordinator supplies usage), same
+        // windows the scalar path enforces, over the decoded totals.
+        if let Some(usage) = usage {
+            for (window, configured, current) in [
+                ("Daily", limits.daily.as_ref(), &usage.daily),
+                ("Hourly", limits.hourly.as_ref(), &usage.hourly),
+                ("Monthly", limits.monthly.as_ref(), &usage.monthly),
+            ] {
+                let Some(map) = configured else { continue };
+                if fx.native_total > 0 {
+                    if let Some(limit) = lookup_limit(map, "native") {
+                        let spent = current.get("native").copied().unwrap_or(0);
+                        if spent.saturating_add(fx.native_total) > limit {
+                            return Some(deny(format!(
+                                "{window} limit exceeded for native: {} + {} > {} (decoded total)",
+                                spent, fx.native_total, limit
+                            )));
+                        }
+                    }
+                }
+                for (token, total) in &token_totals {
+                    if let Some(limit) = lookup_limit(map, token) {
+                        let spent = current.get(*token).copied().unwrap_or(0);
+                        if spent.saturating_add(*total) > limit {
+                            return Some(deny(format!(
+                                "{window} limit exceeded for {token}: {spent} + {total} > {limit} (decoded total)"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Normalize a legacy policy `transaction_types` entry. The deposit family
@@ -1367,6 +1565,280 @@ mod tests {
             matches!(evaluate(&policy, &op, None, 0), Decision::Allow),
             "sign_message must not be denied by transaction_types/allowed_tokens"
         );
+    }
+
+    /// Build a `w_execute_extension` op whose args are the given request JSON.
+    fn door_op(request_json: &str) -> Op {
+        use base64::Engine;
+        Op::Call {
+            to: "agent.tla".into(),
+            method: "w_execute_extension".into(),
+            args_base64: base64::engine::general_purpose::STANDARD.encode(request_json),
+            gas: "100000000000000".into(),
+            deposit: "1".into(),
+        }
+    }
+
+    /// A policy that permits the door itself and generous native amounts —
+    /// what a real bound wallet's owner would set. Every refusal in the tests
+    /// below must therefore come from the DECODED effects, not the outer op.
+    fn door_policy() -> Policy {
+        policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "whitelist",
+                               "list": ["agent.tla", "token.near", "good.near"] },
+                "limits": { "per_transaction": {
+                    "native": "1000000000000000000000000",
+                    "token.near": "1000000"
+                } }
+            }
+        }))
+    }
+
+    #[test]
+    fn w_execute_extension_is_evaluated_by_its_decoded_effects() {
+        let policy = door_policy();
+
+        // Undecodable args are a terminal Deny — including on a multisig
+        // wallet, where escalating to approval would have a human approve
+        // fields that describe nothing.
+        let opaque = door_op("{}");
+        match evaluate(&policy, &opaque, None, 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("w_execute_extension"),
+                "the reason must name the method, got: {reason}"
+            ),
+            other => panic!("expected Deny for undecodable args, got {other:?}"),
+        }
+        let multisig = policy_from(json!({
+            "rules": { "addresses": { "mode": "whitelist", "list": ["agent.tla"] } },
+            "approval": { "threshold": { "required": 2 } }
+        }));
+        assert!(
+            matches!(evaluate(&multisig, &opaque, None, 0), Decision::Deny { .. }),
+            "must be Deny, never RequiresApproval"
+        );
+
+        // A readable request whose every effect passes the rules continues
+        // through the standard pipeline (here: to the generic approval-free
+        // Allow). Whitelisted recipient, in-limit amount.
+        let good = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"good.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1000"}}]}]}}"#,
+        );
+        assert!(matches!(evaluate(&policy, &good, None, 0), Decision::Allow));
+
+        // Other methods on the same account keep their prior behaviour.
+        let ordinary = Op::Call {
+            to: "agent.tla".into(),
+            method: "ft_transfer".into(),
+            args_base64: "e30=".into(),
+            gas: "100000000000000".into(),
+            deposit: "1".into(),
+        };
+        assert!(matches!(evaluate(&policy, &ordinary, None, 0), Decision::Allow));
+    }
+
+    #[test]
+    fn r4_internal_operations_are_denied_with_no_capability_escape() {
+        // AddExtension inside an otherwise innocent request = handing the
+        // whole lane to a stranger. Denied under ANY policy, terminally.
+        let op = door_op(
+            r#"{"request":{
+                "internal":[{"op":"add_extension","payload":{"account_id":"evil.near"}}],
+                "external":[{"receiver_id":"good.near",
+                             "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        // "Under ANY policy" includes the EMPTY one, and that case is the one
+        // that bites: a wallet with nothing stored on chain is the state every
+        // wallet is in immediately after registration, and it is where the
+        // keystore used to skip evaluation entirely. If this arm is ever
+        // allowed to pass, a freshly registered bound wallet can hand its
+        // leased account to a stranger and no component says a word.
+        for (label, policy) in [
+            ("the owner's own rules", door_policy()),
+            ("no policy at all", Policy::default()),
+        ] {
+            match evaluate(&policy, &op, None, 0) {
+                Decision::Deny { reason } => {
+                    assert!(reason.contains("add_extension"), "{label}: {reason}");
+                    assert!(reason.contains("account-control"), "{label}: {reason}");
+                }
+                other => panic!("{label}: expected Deny, got {other:?}"),
+            }
+        }
+    }
+
+    /// The other half of what an empty policy must still refuse: effects it
+    /// cannot state. A call no rule could read could move value no rule
+    /// counted, and "the owner set no rules" is not consent to that.
+    #[test]
+    fn an_empty_policy_still_refuses_a_request_it_cannot_read() {
+        let op = door_op(
+            r#"{"request":{"external":[{"receiver_id":"token.near",
+                 "actions":[{"action":"function_call","payload":{
+                    "function_name":"ft_transfer","args":"!!not base64!!","deposit":"1"}}]}]}}"#,
+        );
+        match evaluate(&Policy::default(), &op, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("cannot state"), "{reason}"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    /// The change that made the two tests above possible must not have made
+    /// an empty policy restrictive for anything else — it is the default state
+    /// of every wallet, and a wallet that cannot transfer after registration
+    /// is a worse bug than the one being fixed.
+    #[test]
+    fn an_empty_policy_allows_every_ordinary_op() {
+        let ops = [
+            Op::Transfer { to: "bob.near".into(), amount: "1".into() },
+            Op::Call {
+                to: "token.near".into(),
+                method: "ft_transfer".into(),
+                args_base64: String::new(),
+                gas: "30000000000000".into(),
+                deposit: "1".into(),
+            },
+        ];
+        for op in &ops {
+            assert!(
+                matches!(evaluate(&Policy::default(), op, None, 0), Decision::Allow),
+                "an empty policy must not restrict {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r2_the_limit_applies_to_the_decoded_amount_not_the_marker() {
+        // 250 NEAR hidden in the args, 1 yocto on the outside. The per-tx
+        // limit (1 NEAR) must meter the 250.
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"good.near",
+                "actions":[{"action":"transfer","payload":{"amount":"250000000000000000000000000"}}]}]}}"#,
+        );
+        match evaluate(&door_policy(), &op, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Per-transaction"), "{reason}"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r2_sublimit_pieces_that_sum_over_the_limit_are_denied() {
+        // Three transfers of 0.4 NEAR against a 1 NEAR limit: each is fine,
+        // the request is not. The request is ONE atomic policy object.
+        let op = door_op(
+            r#"{"request":{"external":[
+                {"receiver_id":"good.near","actions":[{"action":"transfer","payload":{"amount":"400000000000000000000000"}}]},
+                {"receiver_id":"good.near","actions":[
+                    {"action":"transfer","payload":{"amount":"400000000000000000000000"}},
+                    {"action":"transfer","payload":{"amount":"400000000000000000000000"}}]}
+            ]}}"#,
+        );
+        assert!(matches!(
+            evaluate(&door_policy(), &op, None, 0),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn r3_the_logical_recipient_is_ruled_not_the_token_contract() {
+        use base64::Engine;
+        // token.near is whitelisted; bob.near is not. An ft_transfer TO BOB
+        // via token.near must be denied — permitting the contract says
+        // nothing about the destination.
+        let ft = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"bob.near","amount":"5"}"#);
+        let op = door_op(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        match evaluate(&door_policy(), &op, None, 0) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("bob.near"), "{reason}");
+                assert!(reason.contains("promise 0"), "{reason}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refund_destination_faces_the_same_address_rules() {
+        // A deposit on a call engineered to revert lands on refund_to; a rule
+        // keyed on receivers alone would never see it.
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"good.near",
+                "refund_to":"evil.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        match evaluate(&door_policy(), &op, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("refund_to"), "{reason}"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unstatable_calls_are_denied_fail_closed() {
+        use base64::Engine;
+        // ft_transfer_call's msg reaches a third contract; swap has no
+        // semantics at all. Both must refuse, naming the method.
+        let ftc = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"1","msg":"x"}"#);
+        for (method, args) in [("ft_transfer_call", ftc.as_str()), ("swap", "e30=")] {
+            let op = door_op(&format!(
+                r#"{{"request":{{"external":[{{
+                    "receiver_id":"token.near",
+                    "actions":[{{"action":"function_call","payload":{{
+                        "function_name":"{method}","args":"{args}","deposit":"1"}}}}]}}]}}}}"#
+            ));
+            match evaluate(&door_policy(), &op, None, 0) {
+                Decision::Deny { reason } => assert!(reason.contains(method), "{reason}"),
+                other => panic!("expected Deny for {method}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decoded_token_velocity_counts_against_the_windows() {
+        use base64::Engine;
+        // 600k token units moved with 500k already spent today against a 1M
+        // daily cap → denied by the WINDOW, not the per-tx cap.
+        let policy = policy_from(json!({
+            "rules": {
+                "limits": {
+                    "per_transaction": { "token.near": "1000000" },
+                    "daily": { "token.near": "1000000" }
+                }
+            }
+        }));
+        let ft = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"600000"}"#);
+        let op = door_op(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+
+        let mut daily = std::collections::BTreeMap::new();
+        daily.insert("token.near".to_string(), 500_000u128);
+        let usage = Usage { daily, ..Usage::default() };
+
+        assert!(matches!(
+            evaluate(&policy, &op, Some(&usage), 0),
+            Decision::Deny { .. }
+        ));
+        // Without prior spend the same move passes the window.
+        assert!(matches!(
+            evaluate(&policy, &op, Some(&Usage::default()), 0),
+            Decision::Allow
+        ));
     }
 
     #[test]
