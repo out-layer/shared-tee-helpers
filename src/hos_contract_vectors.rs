@@ -190,17 +190,24 @@ impl Grant {
 /// The order matters to these vectors because only the FIRST violation reaches
 /// the caller, so it is the one [`refused_as`] pins.
 fn verdict(fx: &EffectsSet, grant: &Grant, now_ns: u64) -> Vec<Violation> {
-    let admitted = HosLease::admission(fx, &grant.state(), now_ns);
-    if admitted.first().is_some_and(|v| v.answers_alone()) {
-        return admitted;
-    }
-
-    let mut v = HosLease::check_own_collection(fx, THEIR_FIXTURE_COLLECTION_ID);
-    v.extend(admitted);
-    if let VerifiedState::HosLease { status } = &grant.state() {
-        v.extend(HosLease::check_reserve(fx, status, grant.balance_yocto));
-    }
-    v
+    let state = grant.state();
+    let reserve = match &state {
+        VerifiedState::HosLease { status } => {
+            HosLease::check_reserve(fx, status, grant.balance_yocto)
+        }
+        _ => None,
+    };
+    // The SAME assembly the coordinator's pre-flight runs. Calling it rather
+    // than repeating its three steps is what makes these vectors evidence
+    // about the product instead of about this file: while the order lived in
+    // both places, a vector could pass against an assembly nobody shipped.
+    crate::binding::verdict(
+        crate::binding::BindingKind::HosLease,
+        fx,
+        HosLease::admission(fx, &state, now_ns),
+        Some(THEIR_FIXTURE_COLLECTION_ID),
+        reserve,
+    )
 }
 
 /// The class the CALLER is told, which is the first violation in list order.
@@ -630,11 +637,16 @@ fn a_grantee_cannot_move_an_item_outside_the_fence() {
 #[test]
 fn a_grantee_cannot_reach_a_collection_the_grant_never_named() {
     let fx = fx_of(&[nft_transfer("other.testnet", "carol.testnet", "1041")]);
+    // Their `#[should_panic]` reads "collection is not in the spend grant",
+    // and the distinction is the owner's next move: a collection nobody
+    // granted needs a new grant, while an item outside a fence needs a
+    // token_id added to one that exists. This vector asserted the second for
+    // years of the first — the fix that cannot work, for the problem they had.
     refused_as(
         "a_grantee_cannot_reach_a_collection_the_grant_never_named",
         &fx,
         &Grant { items: vec![("art.testnet", vec!["1041"])], ..Default::default() },
-        "item_not_granted",
+        "collection_not_granted",
     );
 }
 
@@ -767,5 +779,166 @@ fn outbound_spending_cannot_breach_the_balance_reserve() {
             ..Default::default()
         },
         "insufficient_vs_reserve",
+    );
+}
+
+// ── Requests that break MORE THAN ONE rule ───────────────────────────────────
+//
+// Every vector above breaks exactly one, and a single-fault request cannot see
+// the difference between "the list is in the contract's order" and "the list
+// happens to have one entry". The contract panics ONCE — at the first rule it
+// trips, walking promises in order — so these pin the FIRST class for requests
+// where several rules apply at once. While the profile collected violations by
+// category (all shape facts, then all methods, then the budget, then all
+// receivers), each of these reported a rule the chain would never have reached.
+
+/// One plain promise, two rules: an ungranted receiver AND more than the
+/// budget allows.
+///
+/// `charge_transfer` checks `receivers.contains` on its first line and only
+/// then adds to `spent_yocto`, so the chain answers RECEIVER_NOT_GRANTED. The
+/// owner told `grant_exhausted` would top up a budget that was never the
+/// problem, retry, and be refused again by the same rule.
+#[test]
+fn an_ungranted_receiver_is_reported_before_the_budget_it_also_breaks() {
+    let fx = fx_of(&[send("stranger.testnet", NEAR * 5)]);
+    refused_as(
+        "charge_transfer: receiver before cap",
+        &fx,
+        &Grant {
+            receivers: vec!["carol.testnet"],
+            budget_yocto: NEAR,
+            balance_yocto: NEAR * 10,
+            ..Default::default()
+        },
+        "receiver_not_granted",
+    );
+}
+
+/// A call into the account's OWN collection that also fails to stand alone.
+///
+/// `charge_promise` demands the call stand alone before `charge_token_call`
+/// runs at all, and the own-collection guard lives inside the latter — one
+/// rung below the deposit check. So the chain answers
+/// GRANT_CALL_MUST_STAND_ALONE, not OWN_COLLECTION_NOT_GRANTABLE.
+#[test]
+fn a_bundled_call_is_reported_for_its_shape_before_its_target() {
+    let bundled = format!(
+        r#"{{"receiver_id":"{THEIR_FIXTURE_COLLECTION_ID}","actions":[
+            {{"action":"function_call","payload":{{"function_name":"nft_transfer",
+              "args":"{}","deposit":"1"}}}},
+            {{"action":"transfer","payload":{{"amount":"1"}}}}]}}"#,
+        args(r#"{"receiver_id":"carol.testnet","token_id":"1041"}"#)
+    );
+    let fx = fx_of(&[bundled]);
+    refused_as(
+        "charge_promise: standalone before own-collection",
+        &fx,
+        &Grant {
+            receivers: vec!["carol.testnet"],
+            items: vec![(THEIR_FIXTURE_COLLECTION_ID, vec!["1041"])],
+            balance_yocto: NEAR * 10,
+            ..Default::default()
+        },
+        "grant_shape_violation:grant_call_must_stand_alone",
+    );
+}
+
+/// Two promises, each breaking a different rule.
+///
+/// The chain charges promise 0 first and panics there, so the answer is about
+/// promise 0 — even though promise 1 breaks a rule that sits EARLIER in the
+/// per-promise ladder. Promise order dominates rung order, and a list sorted
+/// by rule category gets exactly this backwards.
+#[test]
+fn the_earlier_promise_answers_even_when_a_later_one_breaks_an_earlier_rule() {
+    let fx = fx_of(&[
+        send("stranger.testnet", 1),
+        format!(
+            r#"{{"receiver_id":"carol.testnet","refund_to":"attacker.testnet",
+                "actions":[{{"action":"transfer","payload":{{"amount":"1"}}}}]}}"#
+        ),
+    ]);
+    let v = verdict(&fx, &grant_for_two_promises(), NOW_NS);
+    assert_eq!(
+        reported_class(&v).as_deref(),
+        Some("receiver_not_granted"),
+        "promise 0 is charged first, so its refusal is the one the chain raises: {v:#?}"
+    );
+    assert_eq!(
+        v.first().and_then(|x| x.promise_index),
+        Some(0),
+        "the reported violation must be the one on promise 0"
+    );
+}
+
+fn grant_for_two_promises() -> Grant {
+    Grant {
+        receivers: vec!["carol.testnet"],
+        budget_yocto: NEAR,
+        balance_yocto: NEAR * 10,
+        ..Default::default()
+    }
+}
+
+/// Two promises, each affordable alone, together over the cap.
+///
+/// `charge_transfer` writes `spent_yocto` back before the next promise is
+/// charged, so the chain panics on the SECOND one — and the refusal has to
+/// name it. A single total computed over the whole request gives the same
+/// verdict with no address, which is what `grant_exhausted` used to do.
+#[test]
+fn the_budget_is_exhausted_at_the_promise_that_breaches_it() {
+    let fx = fx_of(&[
+        send("carol.testnet", NEAR * 6),
+        send("carol.testnet", NEAR * 6),
+    ]);
+    let v = verdict(
+        &fx,
+        &Grant {
+            receivers: vec!["carol.testnet"],
+            budget_yocto: NEAR * 10,
+            balance_yocto: NEAR * 100,
+            ..Default::default()
+        },
+        NOW_NS,
+    );
+    assert_eq!(reported_class(&v).as_deref(), Some("grant_exhausted"), "{v:#?}");
+    assert_eq!(
+        v.first().and_then(|x| x.promise_index),
+        Some(1),
+        "the first promise fits; the second is the one that breaches the cap"
+    );
+}
+
+/// The reserve is checked AFTER every promise, so a promise-level rule wins.
+///
+/// This is the one the obvious sort key gets wrong: the reserve violation
+/// carries no promise index, and `None` sorts before `Some(0)` — so keying on
+/// `(promise_index, rung)` reports a balance floor ahead of the promise that
+/// breached it, which is the reverse of `execute_request`, where
+/// `assert_within_reserve` runs only after `charge_spend` returned.
+#[test]
+fn the_balance_floor_is_reported_after_the_promise_rules_it_shares_a_request_with() {
+    let fx = fx_of(&[send("stranger.testnet", NEAR * 10)]);
+    let v = verdict(
+        &fx,
+        &Grant {
+            receivers: vec!["carol.testnet"],
+            budget_yocto: NEAR * 10,
+            balance_yocto: NEAR * 10,
+            reserve_yocto: RENTER_BUFFER,
+            ..Default::default()
+        },
+        NOW_NS,
+    );
+    assert_eq!(
+        reported_class(&v).as_deref(),
+        Some("receiver_not_granted"),
+        "the chain never reaches the floor for a request charge_spend refused: {v:#?}"
+    );
+    assert!(
+        classes(&v).iter().any(|c| c == "insufficient_vs_reserve"),
+        "the floor still belongs in the list, just not first: {v:#?}"
     );
 }

@@ -351,9 +351,75 @@ pub trait BindingProfile: sealed::Sealed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     pub promise_index: Option<usize>,
+    /// Where this rule sits in the contract's own pass over the request.
+    ///
+    /// Carried on the violation rather than derived from `rule` afterwards,
+    /// because it cannot be derived: `receiver_not_granted` sits at a
+    /// different rung for a promise that carries a call (`charge_ft_transfer`
+    /// checks it after the arguments parse) than for one that does not
+    /// (`charge_transfer` checks it first). Only the code that knows which
+    /// kind of promise it is looking at knows the rung, and that code is the
+    /// code that builds the violation.
+    pub stage: Stage,
     pub rule: &'static str,
     pub subcode: Option<&'static str>,
     pub message: String,
+}
+
+/// Where a rule sits in the contract's pass, so a list of refusals can be put
+/// in the order the chain would have hit them.
+///
+/// The pre-flight answers `violations.first()` and the contract panics ONCE —
+/// on the first rule it trips, walking promises in order and, inside a promise,
+/// its own ladder. The two therefore agree only if our list is ordered the same
+/// way. While violations were collected by CATEGORY (every shape fact, then
+/// every method, then the budget, then every receiver), the first entry was the
+/// contract's first panic only for requests that broke exactly one rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Read before a single promise is charged: the grant gate. Answers alone
+    /// — see [`Violation::answers_alone`].
+    Door,
+    /// A rung INSIDE one promise, numbered in the contract's order.
+    ///
+    /// A promise either carries a call or it does not, and the two ladders
+    /// never mix, so one scale serves both:
+    ///
+    /// | rung | promise WITHOUT a call (`charge_transfer`) | promise WITH a call (`charge_token_call`) |
+    /// |---|---|---|
+    /// | 1 | `refund_to` set | `refund_to` set |
+    /// | 2 | receiver not granted | call is not standalone |
+    /// | 3 | a non-`Transfer` action | deposit is not one yocto |
+    /// | 4 | native budget exhausted | receiver is the own collection |
+    /// | 5 | — | method is not ft/nft_transfer |
+    /// | 6 | — | arguments unreadable |
+    /// | 7 | — | `approval_id` set (nft) |
+    /// | 8 | — | decoded receiver not granted |
+    /// | 9 | — | token / collection not granted |
+    /// | 10 | — | token budget exceeded / item outside the fence |
+    Promise(u8),
+    /// The balance floor, checked after every promise has been charged.
+    Reserve,
+}
+
+impl Violation {
+    /// Sort key that reproduces the contract's own order.
+    ///
+    /// `Reserve` last and `Door` first are explicit rather than implied by the
+    /// enum's declaration order, because the obvious key — `(promise_index,
+    /// rung)` — puts them both in the WRONG place: they carry no promise
+    /// index, and `None` sorts before `Some(0)`, which would report a balance
+    /// floor ahead of the promise that breached it.
+    pub fn order_key(&self) -> (usize, u8) {
+        match self.stage {
+            Stage::Door => (0, 0),
+            // `+ 1` leaves rank 0 to the door alone. A promise-level rule with
+            // no index cannot be placed among the promises, so it sorts with
+            // the tail — before the reserve, which owns the very last slot.
+            Stage::Promise(rung) => (self.promise_index.map_or(usize::MAX, |i| i + 1), rung),
+            Stage::Reserve => (usize::MAX, u8::MAX),
+        }
+    }
 }
 
 impl Violation {
@@ -401,10 +467,14 @@ impl Violation {
     /// two cannot drift; `every_early_return_answers_alone` in `hos` pins it in
     /// both directions.
     pub fn answers_alone(&self) -> bool {
-        matches!(
-            self.rule,
-            "evidence_mismatch" | "grant_missing" | "grant_unreadable" | "grant_expired"
-        )
+        // Read off the STAGE, not off a second list of rule names. While it
+        // was such a list, adding a door rule meant remembering two places —
+        // the construction site and this match — and a rule added to only one
+        // of them either answers alone when it should not or drags
+        // promise-level rules along when it should not. That is the same
+        // two-list shape as the reserved-name defect, and the stage field
+        // exists precisely so this question has one answer.
+        matches!(self.stage, Stage::Door)
     }
 }
 
@@ -471,6 +541,7 @@ impl BindingProfile for PersonalAccount {
             VerifiedState::PersonalAccount { .. } => Vec::new(),
             VerifiedState::HosLease { .. } => vec![Violation {
                 promise_index: None,
+                stage: Stage::Door,
                 rule: "evidence_mismatch",
                 subcode: None,
                 message: "the verified state belongs to the leased mode, not personal_account"
@@ -545,6 +616,59 @@ pub fn admission(
         BindingKind::HosLease => HosLease::admission(fx, st, now_ns),
         BindingKind::PersonalAccount => PersonalAccount::admission(fx, st, now_ns),
     }
+}
+
+/// The whole verdict, in the order the CHAIN would have reached it.
+///
+/// One function rather than a recipe each caller follows, because the order IS
+/// the answer: the pre-flight surfaces `violations.first()`, and a caller that
+/// assembled the same parts differently would tell the owner to fix a rule the
+/// contract never got to. Two callers already existed — the coordinator's
+/// pre-flight and the golden vectors — and they agreed only by being written
+/// twice from the same paragraph.
+///
+/// Three parts, and each arrives already computed because each needs evidence
+/// the others do not: `admission` needs only the status, the own-collection
+/// rule needs `collection_id` from a second view, and the reserve needs the
+/// account's balance.
+///
+/// * `admitted` — [`admission`]'s answer. Passed IN rather than computed here
+///   because a caller has to look at it first: whether the door refused is
+///   what decides if a balance read is worth an RPC, and computing admission
+///   twice means parsing the grant JSON twice on the path that now runs before
+///   every signature.
+/// * `collection_id` — `None` when the caller could not read it. The rule is
+///   then not applied, which costs gas and never safety: the contract refuses
+///   the same call anyway.
+/// * `reserve` — the balance floor violation, already computed, or `None` when
+///   the balance could not be read. Same reasoning.
+///
+/// A door refusal answers ALONE: when the grant is missing, unreadable or
+/// expired, the chain never charged a promise, so promise-level rules computed
+/// separately describe a stage the request never reached.
+pub fn verdict(
+    kind: BindingKind,
+    fx: &EffectsSet,
+    admitted: Vec<Violation>,
+    collection_id: Option<&str>,
+    reserve: Option<Violation>,
+) -> Vec<Violation> {
+    if admitted.first().is_some_and(|v| v.answers_alone()) {
+        return admitted;
+    }
+
+    let mut all = admitted;
+    if let (BindingKind::HosLease, Some(collection_id)) = (kind, collection_id) {
+        all.extend(HosLease::check_own_collection(fx, collection_id));
+    }
+    all.extend(reserve);
+
+    // Stable, so that two rules landing on the same rung of the same promise
+    // keep the order the profile emitted them in — there is no third fact to
+    // break such a tie with, and shuffling them would make the reported class
+    // depend on the sort's internals.
+    all.sort_by_key(|v| v.order_key());
+    all
 }
 
 /// K8: refuse to sign for a wallet implementation this build has no decoder
@@ -647,6 +771,67 @@ mod tests {
         WALLET_CODE_HASHES[0]
     }
 
+    /// Only the files that DISPATCH may name a mode. Everything else in this
+    /// crate has to be mode-blind, and the list is inverted on purpose.
+    ///
+    /// The guard below it names the two core modules and asks them to stay
+    /// clean. That protects the two files somebody thought of. This one
+    /// protects the ones nobody has written yet: a new module is covered the
+    /// day it appears, because it is not on the list, and the author has to
+    /// come here and argue for it rather than discover the rule later.
+    ///
+    /// What belongs on the list is dispatch and profiles — the places whose
+    /// whole job is knowing which mode this is. A rule that needs the mode
+    /// anywhere else is not a rule, it is a second semantics, and the two
+    /// modes stop being one lane with one of them switched off.
+    #[test]
+    fn only_the_dispatch_and_the_profiles_name_a_mode() {
+        const MAY_NAME_A_MODE: &[&str] = &[
+            // The enum, the trait and the three dispatch points.
+            "binding.rs",
+            // The leased profile: its rules ARE the mode.
+            "hos.rs",
+            // Golden vectors — they drive one profile deliberately.
+            "hos_contract_vectors.rs",
+        ];
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("cannot read src/") {
+            let path = entry.expect("bad dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("non-utf8 file name")
+                .to_string();
+            checked += 1;
+            if MAY_NAME_A_MODE.contains(&name.as_str()) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("cannot read source");
+            if src.contains("BindingKind") {
+                offenders.push(name);
+            }
+        }
+
+        // The scan itself: a rename of the directory, or a build that stopped
+        // shipping these files, would otherwise make this pass on nothing.
+        assert!(
+            checked >= 4,
+            "read only {checked} sources from {dir} — the scan stopped matching the crate"
+        );
+        assert!(
+            offenders.is_empty(),
+            "{offenders:?} name a binding kind. Only dispatch and profiles may: a mode reaching \
+             any other module means the two lanes have separate semantics, and the personal one \
+             stops being the leased one with its grant rules switched off"
+        );
+    }
+
     #[test]
     fn the_core_never_mentions_a_binding_kind() {
         // The guard the trait design promises: mode-blindness of the core is
@@ -654,6 +839,10 @@ mod tests {
         // effects / semantic) goes into this list.
         const CORE_SOURCES: &[(&str, &str)] = &[
             ("wallet_policy.rs", include_str!("wallet_policy.rs")),
+            // The decoder is core by the same directive, and was clean before
+            // it was listed — which is the point: a guard that covers half of
+            // what it names proves nothing about the other half.
+            ("wallet_request_decode.rs", include_str!("wallet_request_decode.rs")),
         ];
         for (name, source) in CORE_SOURCES {
             assert!(
@@ -894,6 +1083,7 @@ mod tests {
     fn a_violation_reports_its_class_with_the_subcode_that_narrows_it() {
         let with_sub = Violation {
             promise_index: Some(1),
+            stage: Stage::Promise(3),
             rule: "grant_shape_violation",
             subcode: Some("grant_call_deposit"),
             message: "x".into(),
@@ -902,7 +1092,8 @@ mod tests {
         assert!(with_sub.is_terminal());
 
         let bare = Violation {
-            promise_index: None,
+            promise_index: Some(0),
+            stage: Stage::Promise(4),
             rule: "grant_exhausted",
             subcode: None,
             message: "x".into(),

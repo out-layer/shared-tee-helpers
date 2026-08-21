@@ -14,7 +14,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::binding::{
-    BindingFault, BindingKind, BindingProfile, ChainVersion, HosLease, VerifiedState, Violation,
+    BindingFault, BindingKind, BindingProfile, ChainVersion, HosLease, Stage, VerifiedState,
+    Violation,
 };
 use crate::wallet_request_decode::{EffectsSet, ShapeFact, TokenAmount};
 
@@ -137,6 +138,7 @@ impl BindingProfile for HosLease {
             VerifiedState::PersonalAccount { .. } => {
                 return vec![Violation {
                     promise_index: None,
+                    stage: Stage::Door,
                     rule: "evidence_mismatch",
                     subcode: None,
                     message: "the verified state belongs to personal_account, not the leased mode"
@@ -154,6 +156,7 @@ impl BindingProfile for HosLease {
         let Some(grant_value) = &status.grant else {
             return vec![Violation {
                 promise_index: None,
+                stage: Stage::Door,
                 rule: "grant_missing",
                 subcode: None,
                 message: "the executor has no spend grant on this account".to_string(),
@@ -164,6 +167,7 @@ impl BindingProfile for HosLease {
             Err(e) => {
                 return vec![Violation {
                     promise_index: None,
+                    stage: Stage::Door,
                     rule: "grant_unreadable",
                     subcode: None,
                     message: format!("the spend grant does not parse: {e}"),
@@ -175,6 +179,7 @@ impl BindingProfile for HosLease {
             _ => {
                 return vec![Violation {
                     promise_index: None,
+                    stage: Stage::Door,
                     rule: "grant_expired",
                     subcode: None,
                     message: "the spend grant has expired (or its expiry is unreadable) — \
@@ -193,30 +198,40 @@ impl BindingProfile for HosLease {
         // `charge_transfer` accepts any number of them — only a promise
         // carrying a CALL must stand alone — so flagging a multi-transfer
         // promise would refuse a request the chain would have executed.
+        // The rung each fact carries is the one the CONTRACT checks it at, and
+        // they are far apart: `refund_to` is the first thing `charge_promise`
+        // looks at, while an unreadable argument is only reached inside
+        // `charge_ft_transfer`, five rules later. Collecting them under one
+        // loop is fine; reporting them in loop order would not be.
         for fact in &fx.shape_facts {
-            let (promise_index, subcode, message) = match fact {
+            let (promise_index, rung, subcode, message) = match fact {
                 ShapeFact::RefundToSet { promise_index } => (
                     *promise_index,
+                    1,
                     "refund_target_not_allowed",
                     "a granted spend cannot redirect refunds".to_string(),
                 ),
                 ShapeFact::CallNotStandalone { promise_index } => (
                     *promise_index,
+                    2,
                     "grant_call_must_stand_alone",
                     "a granted token call may carry no other action".to_string(),
                 ),
                 ShapeFact::CallDepositNotOneYocto { promise_index, deposit } => (
                     *promise_index,
+                    3,
                     "grant_call_deposit",
                     format!("a granted token call attaches exactly one yocto, not {deposit}"),
                 ),
                 ShapeFact::NftApprovalIdSet { promise_index } => (
                     *promise_index,
+                    7,
                     "grant_approval_not_allowed",
                     "a granted transfer cannot spend an approval".to_string(),
                 ),
                 ShapeFact::TokenArgsUnknownField { promise_index, field } => (
                     *promise_index,
+                    6,
                     "grant_args_unreadable",
                     format!(
                         "granted token call arguments are not readable: the contract refuses \
@@ -227,6 +242,7 @@ impl BindingProfile for HosLease {
             };
             violations.push(Violation {
                 promise_index: Some(promise_index),
+                stage: Stage::Promise(rung),
                 rule: "grant_shape_violation",
                 subcode: Some(subcode),
                 message,
@@ -247,6 +263,9 @@ impl BindingProfile for HosLease {
             let readable_method = u.method == "ft_transfer" || u.method == "nft_transfer";
             violations.push(Violation {
                 promise_index: Some(u.promise_index),
+                // The method dispatch is rung 5; unreadable arguments are only
+                // reached once the method matched, which is rung 6.
+                stage: Stage::Promise(if readable_method { 6 } else { 5 }),
                 rule: "grant_shape_violation",
                 subcode: Some(if readable_method {
                     // The right method, arguments the contract cannot parse.
@@ -273,6 +292,9 @@ impl BindingProfile for HosLease {
         for s in &fx.storage_registrations {
             violations.push(Violation {
                 promise_index: Some(s.promise_index),
+                // A storage registration is a CALL, so it reaches the same
+                // method dispatch every other unrecognised method does.
+                stage: Stage::Promise(5),
                 rule: "grant_shape_violation",
                 subcode: Some("grant_method_not_allowed"),
                 message: "a spend grant covers ft_transfer and nft_transfer only, because \
@@ -284,6 +306,10 @@ impl BindingProfile for HosLease {
         for promise_index in &fx.state_inits {
             violations.push(Violation {
                 promise_index: Some(*promise_index),
+                // A state-init rides a promise with no call, so the contract
+                // meets it in `charge_transfer` — where the receiver is
+                // checked BEFORE the "every action is a Transfer" rule.
+                stage: Stage::Promise(3),
                 rule: "grant_shape_violation",
                 subcode: Some("grant_action_not_allowed"),
                 message: "a spend grant covers plain transfers and allowlisted token calls \
@@ -298,27 +324,41 @@ impl BindingProfile for HosLease {
         // is deliberately left out of the NEAR budget (its own words). Adding
         // it here would refuse a request a yocto short of the ceiling that
         // the chain would have accepted.
+        //
+        // Accumulated PROMISE BY PROMISE, because the contract does:
+        // `charge_transfer` writes `grant.spent_yocto` back before the next
+        // promise is charged, so the one that breaches the cap is the one it
+        // panics on. A single total would give the same verdict and no
+        // address — and with no promise index the refusal cannot be placed in
+        // the order the chain would have hit it, which is the whole point of
+        // reporting the first one.
         let budget = grant.budget_yocto.parse::<u128>().unwrap_or(0);
         let spent = grant.spent_yocto.parse::<u128>().unwrap_or(u128::MAX);
-        let native_charged: u128 = fx
-            .native_per_promise
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !fx.call_promises.contains(i))
-            .map(|(_, amount)| *amount)
-            .fold(0u128, |acc, amount| acc.saturating_add(amount));
-        if native_charged > budget.saturating_sub(spent) {
-            violations.push(Violation {
-                promise_index: None,
-                rule: "grant_exhausted",
-                subcode: None,
-                message: format!(
-                    "spend exceeds the granted cap: {} > {} remaining (budget {budget}, \
-                     spent {spent}); re-granting raises the ceiling, revoking resets the meter",
-                    native_charged,
-                    budget.saturating_sub(spent)
-                ),
-            });
+        let remaining = budget.saturating_sub(spent);
+        let mut running = 0u128;
+        for (promise_index, amount) in fx.native_per_promise.iter().enumerate() {
+            if fx.call_promises.contains(&promise_index) {
+                continue;
+            }
+            running = running.saturating_add(*amount);
+            if running > remaining {
+                violations.push(Violation {
+                    promise_index: Some(promise_index),
+                    // Rung 4 on the plain ladder: after the receiver and the
+                    // action check, which `charge_transfer` runs first.
+                    stage: Stage::Promise(4),
+                    rule: "grant_exhausted",
+                    subcode: None,
+                    message: format!(
+                        "spend exceeds the granted cap: {running} > {remaining} remaining \
+                         (budget {budget}, spent {spent}); re-granting raises the ceiling, \
+                         revoking resets the meter"
+                    ),
+                });
+                // One refusal, at the promise that breached it. Reporting the
+                // rest would name promises the chain never reached.
+                break;
+            }
         }
 
         // Destinations. The grant's `receivers` are read differently per
@@ -340,6 +380,12 @@ impl BindingProfile for HosLease {
             if !permitted(receiver) {
                 violations.push(Violation {
                     promise_index: Some(promise_index),
+                    // Rung 2 on the PLAIN ladder — the first thing
+                    // `charge_transfer` checks, before the action rule and
+                    // before the budget. The same class sits at rung 8 for a
+                    // call promise below, which is why the rung cannot be
+                    // recovered from the rule name later.
+                    stage: Stage::Promise(2),
                     rule: "receiver_not_granted",
                     subcode: None,
                     message: format!("receiver '{receiver}' is not in the spend grant"),
@@ -350,6 +396,9 @@ impl BindingProfile for HosLease {
             if !permitted(&m.recipient) {
                 violations.push(Violation {
                     promise_index: Some(m.promise_index),
+                    // Rung 8 on the CALL ladder: the decoded recipient is only
+                    // known once the arguments parsed.
+                    stage: Stage::Promise(8),
                     rule: "receiver_not_granted",
                     subcode: None,
                     message: format!("receiver '{}' is not in the spend grant", m.recipient),
@@ -360,6 +409,9 @@ impl BindingProfile for HosLease {
                 TokenAmount::Fungible(amount) => match grant.tokens.get(&m.token) {
                     None => violations.push(Violation {
                         promise_index: Some(m.promise_index),
+                        // Rung 9: the grant is looked up before the budget on
+                        // it can be compared.
+                        stage: Stage::Promise(9),
                         rule: "token_not_granted",
                         subcode: None,
                         message: format!("token '{}' is not in the spend grant", m.token),
@@ -370,6 +422,7 @@ impl BindingProfile for HosLease {
                         if *amount > cap.saturating_sub(used) {
                             violations.push(Violation {
                                 promise_index: Some(m.promise_index),
+                                stage: Stage::Promise(10),
                                 rule: "token_budget_exceeded",
                                 subcode: None,
                                 message: format!(
@@ -385,24 +438,40 @@ impl BindingProfile for HosLease {
                 // quantity to count, so the grant names the exact token_ids
                 // that may leave and no budget is debited. Charging one here
                 // would invent a rule the chain does not have.
-                TokenAmount::Item(token_id) => {
-                    let fenced = grant
-                        .items
-                        .get(&m.token)
-                        .map(|ids| ids.iter().any(|id| id == token_id))
-                        .unwrap_or(false);
-                    if !fenced {
-                        violations.push(Violation {
-                            promise_index: Some(m.promise_index),
-                            rule: "item_not_granted",
-                            subcode: None,
-                            message: format!(
-                                "item '{token_id}' of '{}' is not in the spend grant",
-                                m.token
-                            ),
-                        });
+                //
+                // The contract answers these two apart, and so must we: it
+                // looks the collection up first (`COLLECTION_NOT_GRANTED` when
+                // the grant never named it) and only then checks the fence
+                // (`ITEM_NOT_GRANTED`). One class for both sent the owner to
+                // add a token_id to a collection they had not granted at all —
+                // the fix that cannot work, for the one problem they had.
+                TokenAmount::Item(token_id) => match grant.items.get(&m.token) {
+                    None => violations.push(Violation {
+                        promise_index: Some(m.promise_index),
+                        stage: Stage::Promise(9),
+                        rule: "collection_not_granted",
+                        subcode: None,
+                        message: format!(
+                            "collection '{}' is not in the spend grant — the grant must name \
+                             the collection before any of its items can move",
+                            m.token
+                        ),
+                    }),
+                    Some(ids) => {
+                        if !ids.iter().any(|id| id == token_id) {
+                            violations.push(Violation {
+                                promise_index: Some(m.promise_index),
+                                stage: Stage::Promise(10),
+                                rule: "item_not_granted",
+                                subcode: None,
+                                message: format!(
+                                    "item '{token_id}' of '{}' is not in the spend grant",
+                                    m.token
+                                ),
+                            });
+                        }
                     }
-                }
+                },
             }
         }
 
@@ -433,6 +502,12 @@ impl HosLease {
             if receiver == collection_id {
                 violations.push(Violation {
                     promise_index: Some(*promise_index),
+                    // Rung 4, NOT first. `charge_token_call` checks the
+                    // deposit above this guard, and `charge_promise` has
+                    // already demanded the call stand alone — so a
+                    // non-standalone call at the own collection is refused by
+                    // the chain for the shape, not for the target.
+                    stage: Stage::Promise(4),
                     rule: "own_collection_refused",
                     subcode: None,
                     message: format!(
@@ -461,6 +536,7 @@ impl HosLease {
         if account_balance_yocto.saturating_sub(fx.native_total) < reserve {
             return Some(Violation {
                 promise_index: None,
+                stage: Stage::Reserve,
                 rule: "insufficient_vs_reserve",
                 subcode: None,
                 message: format!(
@@ -631,6 +707,111 @@ mod tests {
     /// The subcodes, for the class that has them.
     fn subcodes(v: &[Violation]) -> Vec<&'static str> {
         v.iter().filter_map(|x| x.subcode).collect()
+    }
+
+    /// The personal mode adds NOTHING, and that is a decision, not a gap.
+    ///
+    /// Every rule in `HosLease::admission` exists because the HoS contract
+    /// enforces it: the granted-call form, the method allowlist, the grant's
+    /// budgets and receivers, the reserve. The owner's own no-sign contract
+    /// enforces none of them — it accepts bundles, refunds and any deposit —
+    /// so there is no shared subset to inherit and the correct answer is an
+    /// empty one.
+    ///
+    /// That is what makes the personal mode the leased mode with its grant
+    /// rules switched off, and this test is where it stops being a comment.
+    /// A rule added to the personal profile fails here, and whoever added it
+    /// has to say why the two lanes now differ — which is a product decision,
+    /// not an implementation detail.
+    #[test]
+    fn the_personal_mode_adds_no_rules_of_its_own() {
+        use crate::binding::{BindingProfile, PersonalAccount};
+
+        // One request that trips as much of the leased ladder as a single
+        // request can: refund_to, a call that is not standalone, a method the
+        // grant never covers, and a recipient nobody granted.
+        let args = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(r#"{"receiver_id":"stranger.near","amount":"10"}"#)
+        };
+        let fx = fx_from(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "refund_to":"attacker.near",
+                "actions":[
+                  {{"action":"function_call","payload":{{
+                     "function_name":"ft_transfer_call","args":"{args}","deposit":"5"}}}},
+                  {{"action":"transfer","payload":{{"amount":"250"}}}}
+                ]}}]}}}}"#
+        ));
+
+        let leased = granted_state(serde_json::json!({
+            "receivers": ["bob.near"],
+            "budget_yocto": "1", "spent_yocto": "0",
+            "tokens": {}, "items": {}, "expires_at": "2000"
+        }));
+        let leased_violations = HosLease::admission(&fx, &leased, 1000);
+        assert!(
+            leased_violations.len() >= 3,
+            "the fixture must actually trip the leased ladder, or this test proves nothing \
+             about the personal one: {leased_violations:#?}"
+        );
+
+        let personal = VerifiedState::PersonalAccount { code_hash: [0; 32] };
+        let personal_violations = PersonalAccount::admission(&fx, &personal, 1000);
+        assert!(
+            personal_violations.is_empty(),
+            "the personal profile added rules of its own: {personal_violations:#?}\n\
+             Every leased rule comes from the HoS contract, and the owner's contract enforces \
+             none of them — so anything refused here is a rule this codebase invented for one \
+             mode. The wall for a personal binding is the owner's custody policy, in the core."
+        );
+    }
+
+    /// A profile may only ADD refusals — the trait says so, and here it is
+    /// asserted.
+    ///
+    /// The direction matters more than it looks. Core denials are the ones
+    /// that hold for every wallet, bound or not; a profile that could lift one
+    /// would turn a binding into a way to widen what an agent may do, when a
+    /// binding is only ever a way to narrow it. The worst a profile bug can
+    /// then produce is a spurious refusal — never a spurious signature.
+    #[test]
+    fn a_profile_cannot_take_a_refusal_away() {
+        use crate::binding::{verdict, BindingKind, BindingProfile, PersonalAccount, Violation};
+
+        // A refusal that did not come from any profile — the shape a core
+        // denial has when it reaches the assembly.
+        let core_said_no = Violation {
+            promise_index: Some(0),
+            stage: crate::binding::Stage::Promise(2),
+            rule: "receiver_not_granted",
+            subcode: None,
+            message: "core".into(),
+        };
+        let fx = fx_from(
+            r#"{"request":{"external":[{"receiver_id":"bob.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+
+        for kind in [BindingKind::HosLease, BindingKind::PersonalAccount] {
+            let out = verdict(kind, &fx, vec![core_said_no.clone()], None, None);
+            assert!(
+                out.iter().any(|v| v.message == "core"),
+                "{kind:?} dropped a refusal it was handed — a profile may add, never subtract"
+            );
+        }
+
+        // And the personal profile, asked about the wrong evidence, refuses
+        // rather than reinterpreting it.
+        let wrong = VerifiedState::HosLease { status: healthy() };
+        let v = PersonalAccount::admission(&fx, &wrong, 1000);
+        assert_eq!(
+            v.first().map(|x| x.rule),
+            Some("evidence_mismatch"),
+            "a profile handed the other mode's evidence must refuse, not reinterpret"
+        );
     }
 
     #[test]
@@ -1110,6 +1291,7 @@ mod answers_alone_tests {
         ] {
             let v = Violation {
                 promise_index: Some(0),
+                stage: Stage::Promise(1),
                 rule,
                 subcode: None,
                 message: String::new(),

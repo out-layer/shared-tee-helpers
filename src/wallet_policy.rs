@@ -516,7 +516,16 @@ pub struct Rules {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Addresses {
-    /// `"whitelist"`, `"blacklist"`, or `"none"`.
+    /// `"whitelist"`, `"blacklist"`, or `"none"`. Absent means `"whitelist"`.
+    ///
+    /// Any OTHER value refuses the operation rather than being ignored. It
+    /// used to be ignored, and that made a typo — `allowlist` for `whitelist`
+    /// — switch the address filter off entirely while the policy still listed
+    /// the addresses it was no longer enforcing. Nothing reported it; the
+    /// owner's only symptom was a payment that went through.
+    ///
+    /// `"none"` is how an owner asks for no filtering DELIBERATELY, which is
+    /// why it is a value here and not the absence of one.
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -865,7 +874,29 @@ fn evaluate_section(
                         return deny(format!("Address '{}' is blacklisted", dest));
                     }
                 }
-                _ => {}
+                // `none` means what it says: the owner wrote an address block
+                // and asked for no filtering from it. It is a DOCUMENTED value
+                // of this field (see `Addresses::mode`) and the dashboard's own
+                // default, so it gets a branch of its own rather than riding on
+                // a fall-through.
+                "none" => {}
+                // Anything else is read at its STRICTEST, never dropped.
+                // Falling through to allow meant a single typo — `allowlist`
+                // for `whitelist` — silently switched the filter off entirely,
+                // with the policy still listing the addresses it was no longer
+                // enforcing. The owner is told which word, because the
+                // alternative is a wall with no door.
+                // The message says what to DO, because the owner cannot fix
+                // what they cannot read: the policy is encrypted, so nothing
+                // will show them the offending word except this sentence.
+                other => {
+                    return deny(format!(
+                        "this wallet's policy is not readable: address rule mode '{other}' is \
+                         not one of whitelist, blacklist, none. Nothing is signed while a rule \
+                         cannot be applied — re-save the policy in the dashboard, or contact \
+                         support if it was not written there"
+                    ))
+                }
             }
         }
     }
@@ -1047,11 +1078,16 @@ fn evaluate_extension_call(
     // recipients of token moves (R3: permitting token.near says nothing about
     // bob.near), and storage-registration beneficiaries.
     if let Some(addresses) = rules.and_then(|r| r.addresses.as_ref()) {
+        // Same rule as the scalar path, and it has to be the same: the door
+        // route reaches this with the SAME policy document, so a mode the two
+        // read differently would leave one request's destinations filtered and
+        // another's not, for reasons nobody could see.
         let allowed = |dest: &str| -> bool {
             match addresses.mode.as_deref().unwrap_or("whitelist") {
                 "whitelist" => addresses.list.iter().any(|a| a == dest),
                 "blacklist" => !addresses.list.iter().any(|a| a == dest),
-                _ => true,
+                "none" => true,
+                _ => false,
             }
         };
         let mut touched: Vec<(usize, &str, &str)> = Vec::new();
@@ -2205,6 +2241,112 @@ mod tests {
             d => panic!("expected deny, got {:?}", d),
         }
         assert_eq!(evaluate(&policy, &good, None, 0), Decision::Allow);
+    }
+
+    /// A mode neither path recognises turns the address rule OFF, on both.
+    ///
+    /// This was the behaviour, and it was fail-OPEN: `"mode": "allowlist"` —
+    /// a plausible spelling of the word — silently stopped filtering anything,
+    /// while the policy on screen still listed the addresses it was no longer
+    /// enforcing. Nothing anywhere said so, and the owner's only symptom would
+    /// have been a payment that went through.
+    ///
+    /// Both paths are asserted because they read the SAME policy document from
+    /// two different call routes, so a fix applied to one of them leaves a
+    /// wallet whose filtering depends on which door a request came through.
+    #[test]
+    fn an_unrecognised_address_mode_refuses_on_both_paths() {
+        let policy = policy_from(json!({
+            "rules": { "addresses": { "mode": "allowlist", "list": ["good.near"] } }
+        }));
+        // Scalar path: even the address that IS listed is refused, because the
+        // rule cannot be applied at all.
+        for dest in ["good.near", "evil.near"] {
+            let op = Op::Transfer { to: dest.into(), amount: "1".into() };
+            match evaluate(&policy, &op, None, 0) {
+                Decision::Deny { reason } => {
+                    assert!(
+                        reason.contains("allowlist"),
+                        "the refusal must name the word it did not know: {reason}"
+                    );
+                    // And what to do about it. The policy is encrypted, so this
+                    // sentence is the only thing that will ever show the owner
+                    // where the problem is.
+                    assert!(
+                        reason.contains("dashboard"),
+                        "the refusal must tell the owner how to fix it: {reason}"
+                    );
+                }
+                d => panic!("'{dest}' under an unknown mode must be denied, got {d:?}"),
+            }
+        }
+
+        // Door path: same document, same answer. The destination IS in the
+        // list, so anything but a refusal here means the mode was ignored.
+        let door = policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "allowlist", "list": ["good.near"] }
+            }
+        }));
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"good.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        match evaluate(&door, &op, None, 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("address rules"),
+                "the door refusal must come from the address rule, not from something \
+                 else that happens to deny this request: {reason}"
+            ),
+            d => panic!("the door path must refuse an unknown address mode too, got {d:?}"),
+        }
+    }
+
+    /// `none` is a DOCUMENTED value, not an unknown one, and it means no
+    /// filtering.
+    ///
+    /// It rides no fall-through: while the unknown-mode branch was the same
+    /// branch `none` used, tightening one tightened the other, and a value the
+    /// crate's own `Addresses::mode` documents — and the dashboard defaults to
+    /// — would have started refusing every destination. Nothing could have
+    /// found the affected wallets afterwards: policies are encrypted, and the
+    /// write path takes `rules` as an unvalidated `serde_json::Value`.
+    #[test]
+    fn the_documented_none_mode_still_means_no_filtering() {
+        let policy = policy_from(json!({
+            "rules": { "addresses": { "mode": "none", "list": ["good.near"] } }
+        }));
+        // Including an address the list does NOT name: `none` is not a
+        // whitelist spelled differently.
+        for dest in ["good.near", "anyone.near"] {
+            let op = Op::Transfer { to: dest.into(), amount: "1".into() };
+            assert_eq!(
+                evaluate(&policy, &op, None, 0),
+                Decision::Allow,
+                "'{dest}' under mode `none` must pass — the owner asked for no address filter"
+            );
+        }
+
+        // Door path: same document, same answer.
+        let door = policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "none", "list": ["good.near"] }
+            }
+        }));
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"anyone.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        assert_eq!(
+            evaluate(&door, &op, None, 0),
+            Decision::Allow,
+            "the door path must honour `none` too, or a bound wallet filters where a plain \
+             one does not"
+        );
     }
 
     #[test]
