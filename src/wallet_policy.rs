@@ -805,6 +805,32 @@ fn evaluate_section(
         return Decision::Allow;
     }
 
+    // 2a. A limit we cannot read is not a limit we can ignore.
+    //
+    // `lookup_limit` parses and falls back to `None` on failure, and `None`
+    // means "no cap for this token" — so `{"daily":{"native":"0.2"}}`, the
+    // shape an owner reaches for first, silently disarms the wallet instead of
+    // capping it at 0.2 NEAR. Nothing on the write path rejects it either:
+    // the coordinator's `encrypt_policy` hands the JSON to the keystore as
+    // given, and its `sign_policy` only forwards a blob for signing; neither
+    // looks at a limit string.
+    //
+    // Checked over the WHOLE limits block rather than at each lookup, so an
+    // entry for a token this call does not touch is still caught — the owner
+    // hears about the typo before it matters, not on the first call that
+    // happens to hit that token.
+    //
+    // SCOPED to ops that carry an amount, the way the address-rule check below
+    // is scoped to ops that carry a destination: a rule refuses the operations
+    // it applies to, and no others. `sign_message` moves nothing and reads no
+    // limit; freezing it over a typo in a token cap it never consults would be
+    // a refusal the owner cannot connect to anything they did.
+    if op.amount().is_some() {
+        if let Some(decision) = unreadable_limit(rules) {
+            return decision;
+        }
+    }
+
     // 2b. `w_execute_extension` (defuse-wallet's extension door) — DECODE, then
     //     evaluate the DECODED effects. The outer fields of such a call describe
     //     nothing: `to` is the agent's own wallet-contract account, the deposit
@@ -959,7 +985,10 @@ fn evaluate_section(
             if let Some(max) = count_cap {
                 if usage.hourly_tx_count >= max {
                     return deny(format!(
-                        "Rate limit exceeded: {} transactions this hour (max: {})",
+                        "Rate limit exceeded: {} this hour (max: {}). Every request that reached the \
+                         chain counts, whether or not it moved anything; one moving both NEAR \
+                         and a token counts twice. A request refused before it was sent — by \
+                         this policy, or by a pre-flight check — costs nothing",
                         usage.hourly_tx_count, max
                     ));
                 }
@@ -970,7 +999,10 @@ fn evaluate_section(
         if let Some(max) = rules.and_then(|r| r.rate_limit.as_ref()).and_then(|rl| rl.max_per_hour) {
             if usage.hourly_tx_count >= max {
                 return deny(format!(
-                    "Rate limit exceeded: {} transactions this hour (max: {})",
+                    "Rate limit exceeded: {} this hour (max: {}). Every request that reached the \
+                         chain counts, whether or not it moved anything; one moving both NEAR \
+                         and a token counts twice. A request refused before it was sent — by \
+                         this policy, or by a pre-flight check — costs nothing",
                     usage.hourly_tx_count, max
                 ));
             }
@@ -1209,8 +1241,48 @@ fn normalize_policy_type(t: &str) -> &str {
     }
 }
 
-/// Token-specific limit, falling back to the `"*"` wildcard. An unparseable cap is
-/// treated as no limit (`None`).
+/// The first limit in the policy that is not a whole number of the token's
+/// smallest unit, if any — reported so the owner can fix it, refused so it
+/// cannot pass for "unlimited".
+///
+/// Same posture as the address-rule mode check above: nothing is signed while a
+/// rule cannot be applied. The alternative was in production until it was
+/// noticed — a decimal like `"0.2"` parsed as nothing, `lookup_limit` returned
+/// `None`, and the cap that was meant to be the wallet's tightest became no cap
+/// at all.
+fn unreadable_limit(rules: Option<&Rules>) -> Option<Decision> {
+    let limits = rules.and_then(|r| r.limits.as_ref())?;
+    for (window, map) in [
+        ("per_transaction", limits.per_transaction.as_ref()),
+        ("daily", limits.daily.as_ref()),
+        ("hourly", limits.hourly.as_ref()),
+        ("monthly", limits.monthly.as_ref()),
+    ] {
+        let Some(map) = map else { continue };
+        for (token, raw) in map {
+            if raw.parse::<u128>().is_err() {
+                // The offending VALUE is deliberately not quoted back. This
+                // refusal reaches the caller, who may be the agent rather than
+                // the owner, and gate 2a runs before the type, token,
+                // capability and address gates — so someone every later gate
+                // would refuse still reads a figure out of a policy that is
+                // encrypted precisely so it stays inside the keystore. Naming
+                // the window and the token is enough to find and fix it.
+                let _ = raw;
+                return Some(deny(format!(
+                    "this wallet's policy is not readable: the {window} limit for {token} is not \
+                     a whole number in the token's smallest unit (yoctoNEAR for native — 0.2 \
+                     NEAR is '200000000000000000000000'). Nothing is signed while a rule cannot \
+                     be applied — re-save the policy with an integer amount"
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// Token-specific limit, falling back to the `"*"` wildcard. Unparseable caps
+/// cannot reach here: [`unreadable_limit`] refuses the whole request first.
 fn lookup_limit(map: &BTreeMap<String, String>, token: &str) -> Option<u128> {
     map.get(token)
         .or_else(|| map.get("*"))
@@ -1447,6 +1519,76 @@ mod tests {
 
     fn policy_from(v: serde_json::Value) -> Policy {
         serde_json::from_value(v).expect("policy parse")
+    }
+
+    /// A cap the engine cannot read must FREEZE the wallet, not free it.
+    ///
+    /// `lookup_limit` parses and falls back to `None`, and `None` means "no cap
+    /// for this token" — so the single most likely owner typo, writing NEAR
+    /// where yoctoNEAR is meant, turned the tightest limit in the policy into
+    /// no limit at all. Nothing on the write path caught it either, and every
+    /// test in this file wrote well-formed integers, so the suite passed over
+    /// it for as long as it existed.
+    #[test]
+    fn a_limit_we_cannot_parse_denies_instead_of_disappearing() {
+        let op = Op::Transfer { to: "a.near".into(), amount: "1".into() };
+
+        // 0.2 NEAR, written the way a person writes it.
+        let typo = policy_from(json!({
+            "rules": { "limits": { "daily": { "native": "0.2" } } }
+        }));
+        match evaluate(&typo, &op, None, 0) {
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("daily") && reason.contains("native"),
+                    "the owner cannot fix what the refusal does not name: {reason}"
+                );
+                // And it must NOT quote the value back: this refusal reaches
+                // the caller, and the policy is encrypted to keep its figures
+                // inside the keystore. `0.2` appears in the message only as
+                // part of the worked example, which is why this checks the
+                // quoted form.
+                assert!(
+                    !reason.contains("'0.2'"),
+                    "the refusal quotes a figure out of an encrypted policy: {reason}"
+                );
+            }
+            d => panic!("a decimal cap must not read as 'unlimited', got {d:?}"),
+        }
+
+        // Caught even when this call could never touch the offending entry —
+        // a native transfer against a malformed cap for some token.
+        let other_token = policy_from(json!({
+            "rules": { "limits": { "monthly": { "usdc.near": "1_000" } } }
+        }));
+        assert!(
+            matches!(evaluate(&other_token, &op, None, 0), Decision::Deny { .. }),
+            "a typo waiting in an unused entry is still a policy nobody can apply"
+        );
+
+        // The same limit written correctly still allows the transfer, so the
+        // check refuses malformed input rather than limits in general.
+        let ok = policy_from(json!({
+            "rules": { "limits": { "daily": { "native": "200000000000000000000000" } } }
+        }));
+        assert_eq!(evaluate(&ok, &op, None, 0), Decision::Allow);
+
+        // And it refuses only what it applies to. A signature moves nothing and
+        // consults no cap, so a typo in one cannot be a reason to refuse it —
+        // the owner would get a refusal about limits for an operation that has
+        // no amount, and nothing they could act on.
+        let signing = Op::SignMessage {
+            message_hash: "00".repeat(32),
+            recipient: "app.near".into(),
+            purpose: None,
+        };
+        match evaluate(&typo, &signing, None, 0) {
+            Decision::Deny { reason } => assert!(
+                !reason.contains("0.2"),
+                "sign_message was refused over a limit it never reads: {reason}"
+            ),
+            _ => {}
+        }
     }
 
     #[test]
