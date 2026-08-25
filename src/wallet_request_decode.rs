@@ -37,6 +37,16 @@
 //!   `ft_transfer_call`: its `msg` reaches a third contract that can move
 //!   value the arguments do not state, so its effects are not statable.
 //!
+//! Two shapes a reader would not predict from "field for field", both upstream's
+//! own behaviour rather than a divergence of ours:
+//! * both fields of `Request` carry serde defaults, so the POSITIONAL array
+//!   spelling deserialises as well as the map one — `{"request":[]}` is a valid
+//!   empty request, not a parse error. (`Envelope::request` itself is NOT
+//!   defaulted: bare `{}` is refused.)
+//! * an EMPTY request decodes, states no effects, and is therefore permitted by
+//!   every rule — nothing moves and nothing is bypassed, but the signature and
+//!   the executor's gas are spent on a no-op.
+//!
 //! Semantics v1 (what the decoder CAN state):
 //! * NEP-141 `ft_transfer` → token, logical recipient, amount in token units;
 //! * NEP-171 `nft_transfer` → collection, logical recipient, exact `token_id`
