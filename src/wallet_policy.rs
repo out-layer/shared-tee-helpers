@@ -325,12 +325,12 @@ pub fn canonical_json(op: &Op) -> String {
 }
 
 // ---------------------------------------------------------------------------
-/// A wallet signs with its own key, always. There are no connector sub-keys.
-///
-/// If a connector ever needs to act under an address of its own, that is a
-/// feature to design then, and the hard part is not the derivation: a
-/// connector-scoped signature has to move the MESSAGE, the SIGNATURE and the
-/// BALANCE the funds leave from to that address together.
+// A wallet signs with its own key, always. There are no connector sub-keys.
+//
+// If a connector ever needs to act under an address of its own, that is a
+// feature to design then, and the hard part is not the derivation: a
+// connector-scoped signature has to move the MESSAGE, the SIGNATURE and the
+// BALANCE the funds leave from to that address together.
 
 /// `sha256(canonical_json(op))` as lowercase hex.
 pub fn request_hash(op: &Op) -> String {
@@ -870,8 +870,9 @@ fn evaluate_section(
                 .any(|alias| allowed.iter().any(|t| normalize_policy_type(t) == *alias));
         if !ok {
             return deny(format!(
-                "Transaction type '{}' is not allowed by policy",
-                op.primary_type()
+                "Transaction type '{}' is not allowed by policy{}",
+                op.primary_type(),
+                door_type_note(op)
             ));
         }
     }
@@ -882,20 +883,33 @@ fn evaluate_section(
         // same rationale as the transaction_types exemption above.
         let any = allowed.iter().any(|t| t == "*");
         if !any && !matches!(op, Op::SignMessage { .. }) && !allowed.iter().any(|t| t == op.token()) {
-            return deny(format!("Token '{}' is not allowed by policy", op.token()));
+            return deny(format!(
+                "Token '{}' is not allowed by policy{}",
+                op.token(),
+                door_token_note(op)
+            ));
         }
     }
 
     // 5. address whitelist/blacklist (STATELESS).
     if let (Some(addresses), Some(dest)) = (rules.and_then(|r| r.addresses.as_ref()), op.destination()) {
         if !dest.is_empty() {
-            match addresses.mode.as_deref().unwrap_or("whitelist") {
-                "whitelist" => {
+            match address_mode(addresses) {
+                Err(unreadable) => return unreadable,
+                Ok(AddressMode::Whitelist) => {
                     if !addresses.list.iter().any(|a| a == dest) {
-                        return deny(format!("Address '{}' is not in whitelist", dest));
+                        return deny(format!(
+                            "Address '{}' is not in whitelist{}",
+                            dest,
+                            door_note(op)
+                        ));
                     }
                 }
-                "blacklist" => {
+                // No door note here, deliberately: an owner who blacklisted an
+                // account NAMED it, so "is blacklisted" is already the sentence
+                // they can act on. The note exists for the whitelist, where the
+                // refused account is one they never wrote down.
+                Ok(AddressMode::Blacklist) => {
                     if addresses.list.iter().any(|a| a == dest) {
                         return deny(format!("Address '{}' is blacklisted", dest));
                     }
@@ -905,24 +919,7 @@ fn evaluate_section(
                 // of this field (see `Addresses::mode`) and the dashboard's own
                 // default, so it gets a branch of its own rather than riding on
                 // a fall-through.
-                "none" => {}
-                // Anything else is read at its STRICTEST, never dropped.
-                // Falling through to allow meant a single typo — `allowlist`
-                // for `whitelist` — silently switched the filter off entirely,
-                // with the policy still listing the addresses it was no longer
-                // enforcing. The owner is told which word, because the
-                // alternative is a wall with no door.
-                // The message says what to DO, because the owner cannot fix
-                // what they cannot read: the policy is encrypted, so nothing
-                // will show them the offending word except this sentence.
-                other => {
-                    return deny(format!(
-                        "this wallet's policy is not readable: address rule mode '{other}' is \
-                         not one of whitelist, blacklist, none. Nothing is signed while a rule \
-                         cannot be applied — re-save the policy in the dashboard, or contact \
-                         support if it was not written there"
-                    ))
-                }
+                Ok(AddressMode::None) => {}
             }
         }
     }
@@ -1114,12 +1111,21 @@ fn evaluate_extension_call(
         // route reaches this with the SAME policy document, so a mode the two
         // read differently would leave one request's destinations filtered and
         // another's not, for reasons nobody could see.
+        // Read ONCE, before any destination is judged. While the unknown case
+        // was collapsed into the closure below, an unreadable mode refused
+        // every destination in turn and reported the DESTINATION as the
+        // problem — sending an owner to audit a payee list that was correct,
+        // over a misspelt word two lines above it. The word is what they can
+        // act on, and only this path could name it.
+        let mode = match address_mode(addresses) {
+            Ok(mode) => mode,
+            Err(unreadable) => return Some(unreadable),
+        };
         let allowed = |dest: &str| -> bool {
-            match addresses.mode.as_deref().unwrap_or("whitelist") {
-                "whitelist" => addresses.list.iter().any(|a| a == dest),
-                "blacklist" => !addresses.list.iter().any(|a| a == dest),
-                "none" => true,
-                _ => false,
+            match mode {
+                AddressMode::Whitelist => addresses.list.iter().any(|a| a == dest),
+                AddressMode::Blacklist => !addresses.list.iter().any(|a| a == dest),
+                AddressMode::None => true,
             }
         };
         let mut touched: Vec<(usize, &str, &str)> = Vec::new();
@@ -1238,6 +1244,110 @@ fn normalize_policy_type(t: &str) -> &str {
     match t {
         "intents_deposit" | "storage_deposit" | "cross_chain_deposit" => "call",
         other => other,
+    }
+}
+
+/// The three values `addresses.mode` may take, once it has been read.
+///
+/// An enum rather than the string, so that the two places which apply address
+/// rules — the scalar pipeline and the `w_execute_extension` door — cannot
+/// disagree about what a mode MEANS, and so that adding a fourth mode is a
+/// compile error at both rather than a silent fall-through at one.
+#[derive(Clone, Copy)]
+enum AddressMode {
+    Whitelist,
+    Blacklist,
+    None,
+}
+
+/// Read `addresses.mode`, or refuse the whole request naming the word that
+/// cannot be read.
+///
+/// Absent means `whitelist` (the documented default). Anything else is read at
+/// its STRICTEST, never dropped: falling through to allow meant a single typo —
+/// `allowlist` for `whitelist` — silently switched the filter off entirely,
+/// with the policy still listing the addresses it was no longer enforcing.
+/// The owner is told WHICH word, because the policy is encrypted and nothing
+/// else will ever show it to them; and the message says what to do, because the
+/// alternative is a wall with no door.
+fn address_mode(addresses: &Addresses) -> Result<AddressMode, Decision> {
+    match addresses.mode.as_deref().unwrap_or("whitelist") {
+        "whitelist" => Ok(AddressMode::Whitelist),
+        "blacklist" => Ok(AddressMode::Blacklist),
+        "none" => Ok(AddressMode::None),
+        other => Err(deny(format!(
+            "this wallet's policy is not readable: address rule mode '{other}' is \
+             not one of whitelist, blacklist, none. Nothing is signed while a rule \
+             cannot be applied — re-save the policy in the dashboard, or contact \
+             support if it was not written there"
+        ))),
+    }
+}
+
+/// What a refusal has to add when the account it names is the OUTER destination
+/// of an extension call rather than a payee.
+///
+/// A `w_execute_extension` op continues through the scalar gates after its
+/// decoded effects pass (see the dispatch above), and there the destination is
+/// the account the call is aimed AT — which on a bound wallet's fund lane is
+/// the wallet's own bound account, not anyone it is paying. A bare "not in
+/// whitelist" therefore names an account the owner never listed as a payee and
+/// gives them nothing to do about it.
+///
+/// States the RULE and what the destination is on the lane, rather than
+/// asserting that this particular account is the lane's door. Two reasons, and
+/// the second is the load-bearing one:
+///
+/// * this engine is mode-blind — it holds no binding, so "your bound account"
+///   is not a fact available here;
+/// * `receiver_id` is the caller's to choose, and the coordinator's pre-flight
+///   steps aside for any target that is NOT the bound account, so an extension
+///   call can be aimed at some third contract and still arrive here. Telling
+///   the owner that one is their own door would have them whitelist a stranger
+///   on our advice.
+fn door_note(op: &Op) -> &'static str {
+    match op {
+        Op::Call { method, .. } if method == "w_execute_extension" => {
+            " — a w_execute_extension is judged by its decoded effects AND by this outer \
+             destination. On a bound wallet's fund lane that destination is the wallet's own \
+             bound account, which has to be listed in `addresses` too (or use mode 'none')"
+        }
+        _ => "",
+    }
+}
+
+/// The type half of [`door_note`]: a `w_execute_extension` IS a call, whatever
+/// the payment inside it turns out to be.
+///
+/// An owner who permits `transfer` and nothing else has described what the
+/// agent may do, and the lane that does it is refused for being a call — a word
+/// their policy never mentions and their intention never contradicted.
+fn door_type_note(op: &Op) -> &'static str {
+    match op {
+        Op::Call { method, .. } if method == "w_execute_extension" => {
+            " — a w_execute_extension is a `call`, whatever moves inside it, and it is the \
+             only way a bound wallet spends. A policy governing this lane must list `call` in \
+             transaction_types as well"
+        }
+        _ => "",
+    }
+}
+
+/// The token half of [`door_note`]: a function call is denominated in NEAR,
+/// whatever token its decoded effects move.
+///
+/// NOT because the deposit is "just the 1-yoctoNEAR marker". The caller picks
+/// the deposit, and the coordinator meters whatever is attached as native
+/// spend; a sentence promising a marker would teach an owner that native limits
+/// do not apply on this lane, when they apply to exactly this number.
+fn door_token_note(op: &Op) -> &'static str {
+    match op {
+        Op::Call { method, .. } if method == "w_execute_extension" => {
+            " — a function call is denominated in NEAR whatever token moves inside it, and \
+             its attached deposit is metered as native spend. A policy governing this lane \
+             must allow `native` (or `*`) as well"
+        }
+        _ => "",
     }
 }
 
@@ -2385,6 +2495,143 @@ mod tests {
         assert_eq!(evaluate(&policy, &good, None, 0), Decision::Allow);
     }
 
+    /// A whitelist of the accounts an owner means to PAY kills the fund lane,
+    /// and the refusal names an account they never listed as a payee.
+    ///
+    /// The rule is deliberate — a `w_execute_extension` continues through the
+    /// scalar gates after its decoded effects pass, and there the OUTER
+    /// destination is judged too. What is pinned here is that the sentence says
+    /// so, so the owner can act on it instead of auditing a correct list — and
+    /// that it stops short of claiming whose account that destination is, which
+    /// this engine cannot know.
+    #[test]
+    fn a_refusal_that_names_the_outer_destination_says_it_is_judged_too() {
+        let policy = policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "whitelist", "list": ["payee.near"] }
+            }
+        }));
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"payee.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("agent.tla"),
+                    "the refusal names the account it refused: {reason}"
+                );
+                assert!(
+                    reason.contains("outer destination") && reason.contains("addresses"),
+                    "and says the outer destination is judged too, and what to put in the \
+                     policy: {reason}"
+                );
+                // The engine holds no binding and the caller picks `receiver_id`, so an
+                // extension call can be aimed at a third contract and reach exactly this
+                // refusal. A sentence calling THAT account the wallet's own door would have
+                // the owner whitelist a stranger on our advice.
+                assert!(
+                    !reason.contains("this is the account"),
+                    "and does not assert whose account it is: {reason}"
+                );
+            }
+            d => panic!("the outer destination still faces the whitelist, got {d:?}"),
+        }
+    }
+
+    /// The same for the token gate: a call is `native` because that is what a
+    /// call's deposit is denominated in, so narrowing `allowed_tokens` to one
+    /// fungible token stops native spending on the lane — correctly, and
+    /// unreadably until the sentence says which call it is talking about.
+    #[test]
+    fn a_token_refusal_on_the_lane_explains_why_a_call_is_native() {
+        let policy = policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "none", "list": [] },
+                "allowed_tokens": ["usdc.near"]
+            }
+        }));
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"payee.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("native"),
+                    "the refusal names the token it refused: {reason}"
+                );
+                assert!(
+                    reason.contains("denominated in NEAR") && reason.contains("`*`"),
+                    "and explains why a call is native at all, and what to allow: {reason}"
+                );
+                assert!(
+                    !reason.contains("marker"),
+                    "and does NOT promise the deposit is a marker — the caller picks it and \
+                     it is metered: {reason}"
+                );
+            }
+            d => panic!("the outer call's token still faces the allowlist, got {d:?}"),
+        }
+    }
+
+    /// The third member of the same family, and the one an owner is most likely
+    /// to write: `transaction_types: ["transfer"]` describes exactly what they
+    /// want the agent to do, and refuses the only lane that does it.
+    #[test]
+    fn a_type_refusal_on_the_lane_says_the_lane_is_a_call() {
+        let policy = policy_from(json!({
+            "rules": {
+                "transaction_types": ["transfer"],
+                "addresses": { "mode": "none", "list": [] }
+            }
+        }));
+        let op = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"payee.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("call"),
+                    "the refusal names the type it refused: {reason}"
+                );
+                assert!(
+                    reason.contains("transaction_types") && reason.contains("bound wallet"),
+                    "and says a bound wallet's lane IS a call, and what to list: {reason}"
+                );
+            }
+            d => panic!("the outer op is a call and `call` is not permitted, got {d:?}"),
+        }
+    }
+
+    /// The control, and the reason both notes are derived from the OP rather
+    /// than bolted onto every refusal: an ordinary transfer has no door, and a
+    /// sentence about extension lanes in ITS refusal would be noise the owner
+    /// cannot use.
+    #[test]
+    fn an_ordinary_refusal_says_nothing_about_doors() {
+        let policy = policy_from(json!({
+            "rules": {
+                "addresses": { "mode": "whitelist", "list": ["payee.near"] },
+                "allowed_tokens": ["usdc.near"]
+            }
+        }));
+        let op = Op::Transfer { to: "stranger.near".into(), amount: "1".into() };
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => assert!(
+                !reason.contains("door") && !reason.contains("w_execute_extension"),
+                "an ordinary refusal must not explain a lane it never used: {reason}"
+            ),
+            d => panic!("a stranger is not in the whitelist, got {d:?}"),
+        }
+    }
+
     /// A mode neither path recognises turns the address rule OFF, on both.
     ///
     /// This was the behaviour, and it was fail-OPEN: `"mode": "allowlist"` —
@@ -2423,11 +2670,21 @@ mod tests {
             }
         }
 
-        // Door path: same document, same answer. The destination IS in the
-        // list, so anything but a refusal here means the mode was ignored.
+        // Door path: same document, same answer, and now the same SENTENCE.
+        // The destination IS in the list, so anything but a refusal here means
+        // the mode was ignored — and a refusal that names the destination
+        // instead of the word sends the owner to audit a payee list that is
+        // correct, which is what this path used to do.
+        // `call` is deliberately NOT in the permitted types, and that is what
+        // isolates the door: the type gate sits between the door dispatch and
+        // the scalar address check, so if the door stopped refusing an
+        // unreadable mode, this request would come back refused for its TYPE
+        // instead — a different sentence, and the test would see it. Without
+        // that, both paths produce the same words and the assertion cannot
+        // tell which of them spoke.
         let door = policy_from(json!({
             "rules": {
-                "transaction_types": ["call", "transfer"],
+                "transaction_types": ["transfer"],
                 "addresses": { "mode": "allowlist", "list": ["good.near"] }
             }
         }));
@@ -2437,11 +2694,22 @@ mod tests {
                 "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
         );
         match evaluate(&door, &op, None, 0) {
-            Decision::Deny { reason } => assert!(
-                reason.contains("address rules"),
-                "the door refusal must come from the address rule, not from something \
-                 else that happens to deny this request: {reason}"
-            ),
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("allowlist"),
+                    "the door refusal must name the word it did not know, exactly as the \
+                     scalar path does: {reason}"
+                );
+                assert!(
+                    reason.contains("dashboard"),
+                    "and tell the owner how to fix it: {reason}"
+                );
+                assert!(
+                    !reason.contains("good.near"),
+                    "and must NOT blame the destination: it is in the list, and the list is \
+                     not the problem: {reason}"
+                );
+            }
             d => panic!("the door path must refuse an unknown address mode too, got {d:?}"),
         }
     }
