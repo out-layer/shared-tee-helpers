@@ -2032,6 +2032,61 @@ mod tests {
         ));
     }
 
+    /// The same rule, in a token's own units — and the half that had no test.
+    ///
+    /// Native was covered; fungible was not, and breaking the aggregation on
+    /// purpose left all 152 tests green. A per-token cap a caller can walk past
+    /// by sending 6 and 6 against a limit of 10 is not a cap, and the whole
+    /// point of metering the DECODED effects is that one request is one policy
+    /// object however many promises it is spread across.
+    #[test]
+    fn r2_a_token_cap_is_measured_over_the_whole_request() {
+        use base64::Engine;
+        let half = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"6"}"#);
+        let op = door_op(&format!(
+            r#"{{"request":{{"external":[
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{half}","deposit":"1"}}}}]}},
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{half}","deposit":"1"}}}}]}}
+            ]}}}}"#
+        ));
+        let policy = policy_from(json!({
+            "rules": {
+                "transaction_types": ["call", "transfer"],
+                "addresses": { "mode": "whitelist", "list": ["agent.tla", "good.near", "token.near"] },
+                "allowed_tokens": ["*"],
+                "limits": { "per_transaction": { "token.near": "10" } }
+            }
+        }));
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("token.near") && reason.contains("12"),
+                "the refusal must name the token and the SUM it measured, not one piece: {reason}"
+            ),
+            d => panic!("6 + 6 of token.near against a cap of 10 must be denied, got {d:?}"),
+        }
+
+        // And the control, or the test above passes on a rule that simply
+        // refuses everything: the same two moves under the same cap, summing to
+        // exactly the limit, go through.
+        let ok = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"5"}"#);
+        let within = door_op(&format!(
+            r#"{{"request":{{"external":[
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ok}","deposit":"1"}}}}]}},
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ok}","deposit":"1"}}}}]}}
+            ]}}}}"#
+        ));
+        assert!(
+            matches!(evaluate(&policy, &within, None, 0), Decision::Allow),
+            "5 + 5 against a cap of 10 is within it"
+        );
+    }
+
     #[test]
     fn r3_the_logical_recipient_is_ruled_not_the_token_contract() {
         use base64::Engine;

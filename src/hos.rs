@@ -635,6 +635,92 @@ mod tests {
         );
     }
 
+    /// The LIVE `hos_agent_status` from the partner's testnet account
+    /// `alpha.tlademo.testnet`, executor
+    /// `5356b2c0…e325806a`, captured 2026-08-22 by an RPC `call_function`.
+    /// This is the first time the real wire form has been pinned — everything
+    /// before it was built from their docs and their `tests.rs`. If they ever
+    /// reshape the view, this fails instead of the coordinator failing in front
+    /// of them.
+    const LIVE_STATUS_ALPHA_TLADEMO: &str = r#"{
+        "extension_enabled": true,
+        "grant": {
+            "receivers": ["hos-e2e-receiver.testnet"],
+            "budget_yocto": "5000000000000000000000000",
+            "spent_yocto": "0",
+            "tokens": {
+                "usdc.fakes.testnet": {"budget": "100000000", "spent": "0"},
+                "wrap.testnet": {"budget": "5000000000000000000000000", "spent": "0"}
+            },
+            "items": {},
+            "expires_at": "1790293105645958817"
+        },
+        "state": "Active",
+        "frozen": "Unfrozen",
+        "lease_until_ns": "1818746516312653999",
+        "reserve_yocto": "12130000000000000000000",
+        "impl_version": 6
+    }"#;
+
+    #[test]
+    fn the_live_partner_status_parses_and_drives_our_preflight() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+        // 1. It deserializes into our struct with no field left over and no
+        //    field missing — the whole point of pinning the real bytes.
+        let status: AgentStatusView =
+            serde_json::from_str(LIVE_STATUS_ALPHA_TLADEMO).expect("live status must parse");
+        assert_eq!(status.impl_version, 6);
+        assert_eq!(status.state, "Active");
+        assert_eq!(status.frozen, "Unfrozen");
+
+        // 2. verify() accepts it (now is well before both expiries).
+        let now = 1_700_000_000_000_000_000u64;
+        let st = HosLease::verify(&status, now).expect("live status verifies");
+
+        // 3. A granted ft_transfer of 100 USDC to the granted receiver, within
+        //    budget → admitted. This is the exact path the partner ran with a
+        //    throwaway extension before handing the account over.
+        let ok = fx_from(&format!(
+            r#"{{"request":{{"external":[{{"receiver_id":"usdc.fakes.testnet",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{}","deposit":"1"}}}}]}}]}}}}"#,
+            b64(r#"{"receiver_id":"hos-e2e-receiver.testnet","amount":"100000000"}"#)
+        ));
+        assert!(HosLease::admission(&ok, &st, now).is_empty(), "in-budget grant call must pass");
+
+        // 4. The receiver the partner said panics on chain
+        //    ("receiver is not in the spend grant") — our preflight names it
+        //    first, before any gas is spent.
+        let stranger = fx_from(
+            r#"{"request":{"external":[{"receiver_id":"attacker.testnet",
+                "actions":[{"action":"transfer","payload":{"amount":"1000000000000000000000000"}}]}]}}"#,
+        );
+        assert_eq!(
+            rules(&HosLease::admission(&stranger, &st, now)),
+            vec!["receiver_not_granted"]
+        );
+
+        // 5. 101 USDC against the 100 USDC token budget → token_budget_exceeded.
+        let over = fx_from(&format!(
+            r#"{{"request":{{"external":[{{"receiver_id":"usdc.fakes.testnet",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{}","deposit":"1"}}}}]}}]}}}}"#,
+            b64(r#"{"receiver_id":"hos-e2e-receiver.testnet","amount":"100000001"}"#)
+        ));
+        assert_eq!(rules(&HosLease::admission(&over, &st, now)), vec!["token_budget_exceeded"]);
+
+        // 6. Native above the 5 NEAR budget → grant_exhausted. (The reserve
+        //    floor of ~0.012 NEAR can never be reached live: the 5 NEAR grant
+        //    cap trips first, so reserve breach is a stub-only case.)
+        let big = fx_from(
+            r#"{"request":{"external":[{"receiver_id":"hos-e2e-receiver.testnet",
+                "actions":[{"action":"transfer","payload":{"amount":"6000000000000000000000000"}}]}]}}"#,
+        );
+        assert_eq!(rules(&HosLease::admission(&big, &st, now)), vec!["grant_exhausted"]);
+    }
+
     #[test]
     fn a_lease_ending_now_is_already_over() {
         // `<=` not `<`: at the boundary nanosecond the lease is NOT live. An
