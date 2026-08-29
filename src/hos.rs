@@ -721,6 +721,63 @@ mod tests {
         assert_eq!(rules(&HosLease::admission(&big, &st, now)), vec!["grant_exhausted"]);
     }
 
+    /// A grant we cannot read says so, and refuses.
+    ///
+    /// `grant_unreadable` is the only rule in this file nothing ever reached.
+    /// It is also the rule that fires if the partner's spelling and ours ever
+    /// part company — the `rotation_seq` failure, one field over, except that
+    /// here it would refuse EVERY spend on EVERY leased account at once. The
+    /// live grant is pinned above and proves the shapes agree TODAY; this
+    /// proves what happens on the day they stop.
+    #[test]
+    fn a_grant_we_cannot_read_refuses_and_names_itself() {
+        let now = 1_700_000_000_000_000_000u64;
+        let with_grant = |g: serde_json::Value| {
+            let mut s: AgentStatusView =
+                serde_json::from_str(LIVE_STATUS_ALPHA_TLADEMO).expect("live status must parse");
+            s.grant = Some(g);
+            let st = HosLease::verify(&s, now).expect("the identity fields are untouched");
+            let fx = fx_from(
+                r#"{"request":{"external":[{"receiver_id":"hos-e2e-receiver.testnet",
+                    "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+            );
+            rules(&HosLease::admission(&fx, &st, now))
+        };
+
+        // A list where the contract sends a list, a string where it sends a
+        // string — get either backwards and the grant does not parse.
+        assert_eq!(with_grant(serde_json::json!({ "receivers": "bob.near" })), vec!["grant_unreadable"]);
+        assert_eq!(with_grant(serde_json::json!({ "budget_yocto": 5 })), vec!["grant_unreadable"]);
+        assert_eq!(
+            with_grant(serde_json::json!({ "tokens": { "usdc.fakes.testnet": "100" } })),
+            vec!["grant_unreadable"]
+        );
+        // And it is reported ALONE: an owner told about a form rule while the
+        // grant itself is unreadable would go and fix the request.
+        assert_eq!(with_grant(serde_json::json!("a grant, allegedly")), vec!["grant_unreadable"]);
+
+        // A grant that answers with LESS than we expect is a different case and
+        // must NOT be one of these: every field defaults, the empty grant
+        // refuses more rather than less, and the caller hears which rule.
+        let shrunken = with_grant(serde_json::json!({}));
+        assert_eq!(
+            shrunken,
+            vec!["grant_expired"],
+            "a shrunken grant must refuse on its own terms, not as unreadable: {shrunken:?}"
+        );
+
+        // No grant at all is its own rule, and stays distinguishable from both.
+        let mut none: AgentStatusView =
+            serde_json::from_str(LIVE_STATUS_ALPHA_TLADEMO).expect("live status must parse");
+        none.grant = None;
+        let st = HosLease::verify(&none, now).expect("verify");
+        let fx = fx_from(
+            r#"{"request":{"external":[{"receiver_id":"hos-e2e-receiver.testnet",
+                "actions":[{"action":"transfer","payload":{"amount":"1"}}]}]}}"#,
+        );
+        assert_eq!(rules(&HosLease::admission(&fx, &st, now)), vec!["grant_missing"]);
+    }
+
     #[test]
     fn a_lease_ending_now_is_already_over() {
         // `<=` not `<`: at the boundary nanosecond the lease is NOT live. An
@@ -1389,4 +1446,71 @@ mod answers_alone_tests {
             );
         }
     }
+
+    /// The wire form the partner's contract actually sends, byte for byte.
+    ///
+    /// Every other vector in this crate BUILDS an `AgentStatusView` in Rust and
+    /// never deserializes one, so none of them can see a field whose JSON type
+    /// is not what we declared. That is exactly how the `rotation_seq` bug
+    /// survived: a `u64` where the chain sends a decimal string, fifty green
+    /// checks over a form nothing produces, and every real leased binding stuck
+    /// `pending`.
+    ///
+    /// Captured 2026-08-28 from `alpha.tlademo.testnet` on testnet
+    /// (`hos_agent_status{"extension":"council.tlademo.testnet"}`). Three of
+    /// these fields are near-sdk newtypes and arrive as STRINGS; `impl_version`
+    /// is a plain number and arrives as one. Declaring any of them the other
+    /// way is not a lenient parse — it is a refusal, and a refusal on this view
+    /// is what suspends a lane.
+    #[test]
+    fn the_status_wire_form_the_partner_contract_sends_deserializes() {
+        const CAPTURED: &str = r#"{
+            "extension_enabled": true,
+            "grant": null,
+            "state": "Active",
+            "frozen": "Unfrozen",
+            "lease_until_ns": "1818746516312653999",
+            "reserve_yocto": "12130000000000000000000",
+            "impl_version": 6
+        }"#;
+
+        let view: AgentStatusView =
+            serde_json::from_str(CAPTURED).expect("the chain's own answer must deserialize");
+        assert!(view.extension_enabled);
+        assert!(view.grant.is_none());
+        assert_eq!(view.state, "Active");
+        assert_eq!(view.frozen, "Unfrozen", "`frozen` is a FreezeState name, not a boolean");
+        assert_eq!(view.lease_until_ns, "1818746516312653999");
+        assert_eq!(view.reserve_yocto, "12130000000000000000000");
+        assert_eq!(view.impl_version, 6);
+
+        // The near-sdk fields as JSON numbers — the shape a naive fixture
+        // produces — must NOT quietly succeed. If they ever do, the two forms
+        // have diverged and a stub can go green over one the chain never sends.
+        for wrong in [
+            r#"{"lease_until_ns": 1818746516312653999}"#,
+            r#"{"reserve_yocto": 12130000000000000000000}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AgentStatusView>(wrong).is_err(),
+                "a JSON number was accepted where the chain sends a string: {wrong}"
+            );
+        }
+
+        // And `impl_version` the other way round: a string here is not the
+        // wire form either, and reading it as one would let a version gate
+        // pass on a value it never checked.
+        assert!(
+            serde_json::from_str::<AgentStatusView>(r#"{"impl_version": "6"}"#).is_err(),
+            "`impl_version` is a plain number on the wire"
+        );
+
+        // A missing field is a DEFAULT, not an error — the fail-closed checks
+        // below read those defaults, and they must be reachable.
+        let bare: AgentStatusView = serde_json::from_str("{}").expect("an empty answer defaults");
+        assert!(!bare.extension_enabled);
+        assert_eq!(bare.lease_until_ns, "0");
+        assert_eq!(bare.reserve_yocto, "0");
+    }
+
 }

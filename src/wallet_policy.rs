@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Canonical operation
@@ -714,6 +714,26 @@ pub struct Usage {
     pub hourly: BTreeMap<String, u128>,
     pub monthly: BTreeMap<String, u128>,
     pub hourly_tx_count: i64,
+    /// Counters the coordinator stored but this engine could not read, as
+    /// `"<window>:<token>"` (`"daily:native"`).
+    ///
+    /// An absent counter and an unreadable one are not the same fact. Absent
+    /// means nothing has been spent; unreadable means we do not know what has,
+    /// and reading the second as the first is a cap that silently stops
+    /// applying — the one direction a velocity rule must never fail in. Only
+    /// the operations measured against such a counter are refused, so one bad
+    /// row cannot wedge every token in the wallet.
+    pub unreadable: BTreeSet<String>,
+    /// The counters could not be read AT ALL — the coordinator's query failed,
+    /// or what arrived is not a usage document.
+    ///
+    /// Distinct from an empty `Usage`, which says "this wallet has spent
+    /// nothing today" and is a fact. This says we do not know, and it is the
+    /// far likelier failure: a pool exhausted, a database restarting, a query
+    /// timing out. Read as "nothing spent" it lifts every velocity cap in the
+    /// wallet for the duration, silently, at exactly the moment the system is
+    /// least healthy.
+    pub all_unreadable: bool,
 }
 
 impl Usage {
@@ -721,26 +741,55 @@ impl Usage {
     /// `{ "daily": {tok: "amt"}, "hourly": {...}, "monthly": {...}, "hourly_tx_count": N }`.
     /// Unparseable amounts are treated as 0 (matches the legacy engine).
     pub fn from_current_usage(value: &serde_json::Value) -> Self {
-        fn parse_map(v: Option<&serde_json::Value>) -> BTreeMap<String, u128> {
-            v.and_then(|m| m.as_object())
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, val)| {
-                            let amt = val.as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-                            (k.clone(), amt)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+        fn parse_map(
+            window: &str,
+            v: Option<&serde_json::Value>,
+            unreadable: &mut BTreeSet<String>,
+        ) -> BTreeMap<String, u128> {
+            let mut out = BTreeMap::new();
+            let Some(map) = v.and_then(|m| m.as_object()) else { return out };
+            for (token, val) in map {
+                match val.as_str().and_then(|s| s.parse::<u128>().ok()) {
+                    Some(amt) => {
+                        out.insert(token.clone(), amt);
+                    }
+                    // NOT zero. A stored figure we cannot read means the spend
+                    // is unknown, and a cap compared against an unknown spend
+                    // is no cap at all.
+                    None => {
+                        unreadable.insert(format!("{window}:{token}"));
+                    }
+                }
+            }
+            out
         }
+        // A usage DOCUMENT names its windows. The coordinator's reader always
+        // writes all three, so anything without at least one of them is not a
+        // usage document at all — a `null` from a query that failed, a body
+        // that did not parse, a shape from some other version.
+        //
+        // This is where a failed read is caught, rather than at each of the
+        // fifteen callers that ask for one: `unwrap_or_default()` on the
+        // coordinator's `Result<Value, _>` yields `Value::Null`, and every one
+        // of those calls used to hand it on as "nothing has been spent".
+        let is_document = ["daily", "hourly", "monthly"]
+            .iter()
+            .any(|k| value.get(k).is_some());
+        if !is_document {
+            return Usage { all_unreadable: true, ..Usage::default() };
+        }
+
+        let mut unreadable = BTreeSet::new();
         Usage {
-            daily: parse_map(value.get("daily")),
-            hourly: parse_map(value.get("hourly")),
-            monthly: parse_map(value.get("monthly")),
+            daily: parse_map("daily", value.get("daily"), &mut unreadable),
+            hourly: parse_map("hourly", value.get("hourly"), &mut unreadable),
+            monthly: parse_map("monthly", value.get("monthly"), &mut unreadable),
             hourly_tx_count: value
                 .get("hourly_tx_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0),
+            unreadable,
+            all_unreadable: false,
         }
     }
 }
@@ -951,13 +1000,16 @@ fn evaluate_section(
         // 7. velocity caps (STATEFUL — only when usage is supplied).
         if let Some(usage) = usage {
             if let Some(amt) = amount {
-                for (window, configured, current) in [
-                    ("Daily", limits.daily.as_ref(), &usage.daily),
-                    ("Hourly", limits.hourly.as_ref(), &usage.hourly),
-                    ("Monthly", limits.monthly.as_ref(), &usage.monthly),
+                for (window, key, configured, current) in [
+                    ("Daily", "daily", limits.daily.as_ref(), &usage.daily),
+                    ("Hourly", "hourly", limits.hourly.as_ref(), &usage.hourly),
+                    ("Monthly", "monthly", limits.monthly.as_ref(), &usage.monthly),
                 ] {
                     if let Some(map) = configured {
                         if let Some(limit) = lookup_limit(map, token) {
+                            if let Some(d) = counter_unreadable(usage, key, token) {
+                                return d;
+                            }
                             let spent = current.get(token).copied().unwrap_or(0);
                             if spent.saturating_add(amt) > limit {
                                 return deny(format!(
@@ -980,6 +1032,16 @@ fn evaluate_section(
             .flatten()
             .min();
             if let Some(max) = count_cap {
+                // The count is a counter too, and an unknown one is not zero.
+                if usage.all_unreadable {
+                    return deny(
+                        "this wallet's transaction count could not be read, so the hourly rate \
+                         limit cannot be applied. Nothing is signed while a rule cannot be \
+                         applied — this is our stored figure rather than anything in the policy, \
+                         so it needs an operator, not a re-save"
+                            .to_string(),
+                    );
+                }
                 if usage.hourly_tx_count >= max {
                     return deny(format!(
                         "Rate limit exceeded: {} this hour (max: {}). Every request that reached the \
@@ -994,6 +1056,15 @@ fn evaluate_section(
     } else if let Some(usage) = usage {
         // No `limits` block but a standalone `rate_limit` may still apply (STATEFUL).
         if let Some(max) = rules.and_then(|r| r.rate_limit.as_ref()).and_then(|rl| rl.max_per_hour) {
+            if usage.all_unreadable {
+                return deny(
+                    "this wallet's transaction count could not be read, so the hourly rate limit \
+                     cannot be applied. Nothing is signed while a rule cannot be applied — this \
+                     is our stored figure rather than anything in the policy, so it needs an \
+                     operator, not a re-save"
+                        .to_string(),
+                );
+            }
             if usage.hourly_tx_count >= max {
                 return deny(format!(
                     "Rate limit exceeded: {} this hour (max: {}). Every request that reached the \
@@ -1203,14 +1274,23 @@ fn evaluate_extension_call(
         // Velocity windows (STATEFUL — coordinator supplies usage), same
         // windows the scalar path enforces, over the decoded totals.
         if let Some(usage) = usage {
-            for (window, configured, current) in [
-                ("Daily", limits.daily.as_ref(), &usage.daily),
-                ("Hourly", limits.hourly.as_ref(), &usage.hourly),
-                ("Monthly", limits.monthly.as_ref(), &usage.monthly),
+            for (window, key, configured, current) in [
+                ("Daily", "daily", limits.daily.as_ref(), &usage.daily),
+                ("Hourly", "hourly", limits.hourly.as_ref(), &usage.hourly),
+                ("Monthly", "monthly", limits.monthly.as_ref(), &usage.monthly),
             ] {
                 let Some(map) = configured else { continue };
                 if fx.native_total > 0 {
                     if let Some(limit) = lookup_limit(map, "native") {
+                        // Redundant today and kept anyway: a door call always
+                        // carries a native deposit, so the scalar gate below
+                        // reaches this same window a moment later and refuses
+                        // on the same counter. That is a coincidence of the
+                        // 1-yocto marker, not a property of this path, and the
+                        // token arm beside it has no such second chance.
+                        if let Some(d) = counter_unreadable(usage, key, "native") {
+                            return Some(d);
+                        }
                         let spent = current.get("native").copied().unwrap_or(0);
                         if spent.saturating_add(fx.native_total) > limit {
                             return Some(deny(format!(
@@ -1222,6 +1302,9 @@ fn evaluate_extension_call(
                 }
                 for (token, total) in &token_totals {
                     if let Some(limit) = lookup_limit(map, token) {
+                        if let Some(d) = counter_unreadable(usage, key, token) {
+                            return Some(d);
+                        }
                         let spent = current.get(*token).copied().unwrap_or(0);
                         if spent.saturating_add(*total) > limit {
                             return Some(deny(format!(
@@ -1391,6 +1474,39 @@ fn unreadable_limit(rules: Option<&Rules>) -> Option<Decision> {
     None
 }
 
+/// A counter this operation would be measured against, which we could not read.
+///
+/// Mirrors [`unreadable_limit`] from the other side: that one refuses when the
+/// RULE cannot be applied, this one when the FIGURE it applies to cannot. Both
+/// refuse rather than fall through, because the fall-through in each case is
+/// "no cap".
+///
+/// SCOPED to the window and token actually being checked. An unreadable row for
+/// some other token is not this operation's problem, and refusing the whole
+/// wallet over it would leave an owner with no remedy at all — the figure is in
+/// our database, not in their policy.
+fn counter_unreadable(usage: &Usage, window: &str, token: &str) -> Option<Decision> {
+    if usage.all_unreadable {
+        return Some(deny(format!(
+            "this wallet's spend counters could not be read, so the {window} limit for {token} \
+             cannot be applied. Nothing is signed while a rule cannot be applied — this is our \
+             stored figure rather than anything in the policy, so it needs an operator, not a \
+             re-save"
+        )));
+    }
+    usage
+        .unreadable
+        .contains(&format!("{window}:{token}"))
+        .then(|| {
+            deny(format!(
+                "this wallet's {window} spend for {token} could not be read, so the {window} \
+                 limit cannot be applied. Nothing is signed while a rule cannot be applied — \
+                 this is a stored figure rather than anything in the policy, so it needs an \
+                 operator, not a re-save"
+            ))
+        })
+}
+
 /// Token-specific limit, falling back to the `"*"` wildcard. Unparseable caps
 /// cannot reach here: [`unreadable_limit`] refuses the whole request first.
 fn lookup_limit(map: &BTreeMap<String, String>, token: &str) -> Option<u128> {
@@ -1415,19 +1531,38 @@ fn check_time_restrictions(tr: &TimeRestrictions, now_unix: u64) -> Option<Decis
     let weekday = (((now_unix / 86_400) + 3) % 7 + 1) as u32;
 
     if let Some(hours) = tr.allowed_hours.as_ref() {
-        if hours.len() == 2 {
-            let (start, end) = (hours[0], hours[1]);
-            let in_range = if start <= end {
-                hour >= start && hour < end
-            } else {
-                hour >= start || hour < end
-            };
-            if !in_range {
-                return Some(deny(format!(
-                    "Operation not allowed at this hour ({} UTC). Allowed: {}-{}",
-                    hour, start, end
-                )));
-            }
+        // Exactly two entries, both a real hour, or the rule cannot be applied
+        // — and a rule that cannot be applied is not a rule that is absent.
+        //
+        // The field is named for the hours it allows, so `[9, 10, 11, 12]` is
+        // what an owner writing one by hand reaches for first; `[9]` is the
+        // second. Skipping the check for either of them leaves the policy
+        // listing a restriction it no longer enforces, with no symptom but a
+        // payment that went through at three in the morning. That is the same
+        // failure the `addresses.mode` typo used to cause, and it is refused
+        // here for the same reason.
+        let readable = hours.len() == 2 && hours.iter().all(|h| *h < 24);
+        if !readable {
+            return Some(deny(
+                "this wallet's policy is not readable: `allowed_hours` must be exactly two \
+                 entries, `[start, end]`, each an hour from 0 to 23 — nine to five is \
+                 `[9, 17]`, and a window may wrap midnight as `[22, 6]`. Nothing is signed \
+                 while a rule cannot be applied; re-save the policy with two hours, or omit \
+                 the field if no hour restriction was meant"
+                    .to_string(),
+            ));
+        }
+        let (start, end) = (hours[0], hours[1]);
+        let in_range = if start <= end {
+            hour >= start && hour < end
+        } else {
+            hour >= start || hour < end
+        };
+        if !in_range {
+            return Some(deny(format!(
+                "Operation not allowed at this hour ({} UTC). Allowed: {}-{}",
+                hour, start, end
+            )));
         }
     }
 
@@ -3091,4 +3226,892 @@ mod tests {
             );
         }
     }
+
+    // =======================================================================
+    // Custody limits — boundaries, precedence, and the rules with no test
+    //
+    // Every velocity case below feeds `Usage` through `from_current_usage` in
+    // the exact shape `get_current_usage` writes, so none of them can pass
+    // over a wire form the coordinator never produces.
+    // =======================================================================
+
+    fn transfer(amount: &str) -> Op {
+        Op::Transfer { to: "dest.near".into(), amount: amount.into() }
+    }
+
+    fn usage_json(daily: serde_json::Value, hourly: serde_json::Value, monthly: serde_json::Value, tx: i64) -> Usage {
+        Usage::from_current_usage(&json!({
+            "daily": daily, "hourly": hourly, "monthly": monthly, "hourly_tx_count": tx,
+        }))
+    }
+
+    /// Some fixed moments, so the time tests read as dates rather than integers.
+    const FRI_NOON: u64 = 1_787_918_400; // 2026-08-28 12:00 UTC, a Friday
+    const FRI_0900: u64 = 1_787_907_600; // 09:00 exactly — the inclusive edge
+    const FRI_1730: u64 = 1_787_938_200; // 17:30 — past an exclusive 17
+    const FRI_2330: u64 = 1_787_959_800;
+    const FRI_0530: u64 = 1_787_895_000;
+    const MON_NOON: u64 = 1_787_572_800; // 2026-08-24, a Monday
+    const SUN_NOON: u64 = 1_788_091_200; // 2026-08-30, a Sunday
+
+    /// Every window refuses the unit that CROSSES it, not the one that reaches it.
+    ///
+    /// Four windows, one comparison each, and no reason for them to differ. A
+    /// `>=` in any of them refuses the payment that exactly exhausts the budget
+    /// the owner set — which is the payment they most expect to go through, and
+    /// the one they will not think to test.
+    #[test]
+    fn every_window_admits_the_spend_that_reaches_it_and_refuses_the_one_that_crosses_it() {
+        // per_transaction is stateless: the amount alone is measured.
+        let p = policy_from(json!({ "rules": { "limits": { "per_transaction": { "native": "100" } } } }));
+        assert_eq!(evaluate(&p, &transfer("100"), None, 0), Decision::Allow, "the exact cap is inside it");
+        match evaluate(&p, &transfer("101"), None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Per-transaction"), "{reason}"),
+            d => panic!("one over the per-transaction cap must be refused, got {d:?}"),
+        }
+
+        // The three stateful windows measure spent + amount, and must agree.
+        for (window, named) in [("daily", "Daily"), ("hourly", "Hourly"), ("monthly", "Monthly")] {
+            let p = policy_from(json!({ "rules": { "limits": { window: { "native": "100" } } } }));
+            let spent = |n: &str| {
+                let m = json!({ "native": n });
+                match window {
+                    "daily" => usage_json(m, json!({}), json!({}), 0),
+                    "hourly" => usage_json(json!({}), m, json!({}), 0),
+                    _ => usage_json(json!({}), json!({}), m, 0),
+                }
+            };
+            assert_eq!(
+                evaluate(&p, &transfer("40"), Some(&spent("60")), 0),
+                Decision::Allow,
+                "{window}: 60 + 40 = 100 is the cap, not past it"
+            );
+            match evaluate(&p, &transfer("41"), Some(&spent("60")), 0) {
+                Decision::Deny { reason } => assert!(
+                    reason.contains(named),
+                    "{window}: the refusal must name the window that is full, got {reason}"
+                ),
+                d => panic!("{window}: 60 + 41 > 100 must be refused, got {d:?}"),
+            }
+        }
+    }
+
+    /// A cap of zero is a cap.
+    ///
+    /// `lookup_limit` returns `Option<u128>` and `None` means "no cap for this
+    /// token", so a zero that ever became a `None` — through a truthiness test,
+    /// an `unwrap_or_default`, a `filter(|l| *l > 0)` — would turn the tightest
+    /// instruction an owner can write into the absence of one.
+    #[test]
+    fn a_zero_cap_denies_and_names_the_rule_that_did_it() {
+        let per_tx = policy_from(json!({ "rules": { "limits": { "per_transaction": { "native": "0" } } } }));
+        match evaluate(&per_tx, &transfer("1"), None, 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("Per-transaction") && reason.contains("native"),
+                "an owner who typed a zero should not be reading tea leaves: {reason}"
+            ),
+            d => panic!("a zero per-transaction cap must deny, got {d:?}"),
+        }
+
+        let daily = policy_from(json!({ "rules": { "limits": { "daily": { "native": "0" } } } }));
+        let nothing_spent = usage_json(json!({}), json!({}), json!({}), 0);
+        match evaluate(&daily, &transfer("1"), Some(&nothing_spent), 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Daily"), "{reason}"),
+            d => panic!("a zero daily cap must deny even with nothing spent, got {d:?}"),
+        }
+
+        // It denies MOVEMENT, not the request: an op that moves nothing is not
+        // caught by a cap of zero, the same way it is not caught by a cap of ten.
+        assert_eq!(evaluate(&per_tx, &transfer("0"), None, 0), Decision::Allow);
+    }
+
+    /// A named token's cap overrides the wildcard — in BOTH directions.
+    ///
+    /// Only the second half proves precedence. A rule that took the minimum of
+    /// the two would pass a test that only ever tightens, and would silently
+    /// refuse every per-token cap an owner raised above their default.
+    #[test]
+    fn a_named_token_cap_overrides_the_wildcard_in_both_directions() {
+        let usdc = |amt: &str| Op::Withdraw {
+            to: "dest.near".into(),
+            amount: amt.into(),
+            token: "usdc.near".into(),
+        };
+
+        let tighter = policy_from(json!({
+            "rules": { "limits": { "per_transaction": { "*": "100", "usdc.near": "5" } } }
+        }));
+        assert!(
+            matches!(evaluate(&tighter, &usdc("50"), None, 0), Decision::Deny { .. }),
+            "the wildcard was applied over a tighter named cap"
+        );
+
+        let looser = policy_from(json!({
+            "rules": { "limits": { "per_transaction": { "*": "5", "usdc.near": "100" } } }
+        }));
+        assert_eq!(
+            evaluate(&looser, &usdc("50"), None, 0),
+            Decision::Allow,
+            "the wildcard was applied over a looser named cap"
+        );
+
+        // And the wildcard still covers a token nobody wrote down — otherwise
+        // it is not a default, just an entry with an odd name.
+        let unnamed = Op::Withdraw { to: "dest.near".into(), amount: "50".into(), token: "dai.near".into() };
+        assert!(matches!(evaluate(&looser, &unnamed, None, 0), Decision::Deny { .. }));
+        assert_eq!(evaluate(&tighter, &unnamed, None, 0), Decision::Allow);
+
+        // The same precedence in a stateful window, where the fallback is read
+        // a second time against the spend counter.
+        let daily = policy_from(json!({
+            "rules": { "limits": { "daily": { "*": "10", "usdc.near": "1000" } } }
+        }));
+        let spent = usage_json(json!({ "usdc.near": "500" }), json!({}), json!({}), 0);
+        assert_eq!(evaluate(&daily, &usdc("400"), Some(&spent), 0), Decision::Allow);
+        assert!(matches!(evaluate(&daily, &usdc("600"), Some(&spent), 0), Decision::Deny { .. }));
+    }
+
+    /// An hour window that wraps midnight is a window, not an empty set.
+    ///
+    /// `[22, 6]` is a night shift. Read as `hour >= 22 && hour < 6` it refuses
+    /// every hour of every day, and the owner's only symptom is a wallet that
+    /// stopped working for no stated reason.
+    #[test]
+    fn an_hour_window_that_wraps_midnight_is_a_window_and_not_an_empty_set() {
+        let night = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [22, 6] } }
+        }));
+        assert_eq!(evaluate(&night, &transfer("1"), None, FRI_2330), Decision::Allow, "23:30 is inside 22-6");
+        assert_eq!(evaluate(&night, &transfer("1"), None, FRI_0530), Decision::Allow, "05:30 is inside 22-6");
+        assert!(
+            matches!(evaluate(&night, &transfer("1"), None, FRI_NOON), Decision::Deny { .. }),
+            "noon is outside a night window"
+        );
+
+        // The ordinary direction, with the edges pinned: start inclusive, end
+        // exclusive. `[9, 17]` is the shape every owner writes first, and
+        // "does 17:30 count as 17:00-17:59" is the question they never ask.
+        let day = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 17] } }
+        }));
+        assert_eq!(evaluate(&day, &transfer("1"), None, FRI_0900), Decision::Allow, "09:00 is the inclusive start");
+        assert_eq!(evaluate(&day, &transfer("1"), None, FRI_NOON), Decision::Allow);
+        assert!(
+            matches!(evaluate(&day, &transfer("1"), None, FRI_1730), Decision::Deny { .. }),
+            "17 is the exclusive end, so 17:30 is out"
+        );
+
+        // A window whose ends are equal admits nothing. That is the reading
+        // that fails closed, and it is worth pinning because the other one —
+        // "all day" — is equally arguable and unsafe.
+        let degenerate = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 9] } }
+        }));
+        assert!(matches!(evaluate(&degenerate, &transfer("1"), None, FRI_0900), Decision::Deny { .. }));
+    }
+
+    /// An hour window we cannot read refuses, the way an unreadable cap does.
+    ///
+    /// The field is named for the hours it allows, so a list of them is the
+    /// first thing an owner writes. Ignoring the ones that are not a
+    /// `[start, end]` pair left the policy listing a restriction it had stopped
+    /// enforcing — no error, no log, and the only symptom a payment that went
+    /// through at three in the morning.
+    #[test]
+    fn an_hour_window_we_cannot_read_refuses_instead_of_disappearing() {
+        // Each of these is a plausible thing to write, and each used to mean
+        // "no hour restriction at all".
+        for shape in [json!([9, 10, 11, 12]), json!([9]), json!([]), json!([9, 17, 20])] {
+            let p = policy_from(json!({
+                "rules": { "time_restrictions": { "allowed_hours": shape } }
+            }));
+            match evaluate(&p, &transfer("1"), None, FRI_NOON) {
+                Decision::Deny { reason } => assert!(
+                    reason.contains("allowed_hours"),
+                    "the owner cannot fix what the refusal does not name: {reason}"
+                ),
+                d => panic!("an unreadable hour window must not read as no window, got {d:?}"),
+            }
+        }
+
+        // An hour that is not an hour is the same failure by another road:
+        // `[9, 99]` reads as 09:00 to the end of the day and quietly widens the
+        // window the owner wrote.
+        let out_of_range = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 99] } }
+        }));
+        assert!(matches!(
+            evaluate(&out_of_range, &transfer("1"), None, FRI_NOON),
+            Decision::Deny { .. }
+        ));
+
+        // A well-formed pair still works, so this refuses malformed input and
+        // not windows in general — including the one that wraps midnight.
+        for good in [json!([9, 17]), json!([22, 6]), json!([0, 23])] {
+            let p = policy_from(json!({
+                "rules": { "time_restrictions": { "allowed_hours": good.clone() } }
+            }));
+            let at = if good == json!([22, 6]) { FRI_2330 } else { FRI_NOON };
+            assert_eq!(evaluate(&p, &transfer("1"), None, at), Decision::Allow, "{good}");
+        }
+
+        // And omitting the field is how an owner asks for no hour restriction.
+        let none = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_days": [1, 2, 3, 4, 5, 6, 7] } }
+        }));
+        assert_eq!(evaluate(&none, &transfer("1"), None, FRI_2330), Decision::Allow);
+    }
+
+    /// `allowed_days` is an ISO weekday, counted from a Thursday epoch.
+    ///
+    /// The arithmetic hinges on 1970-01-01 having been a Thursday. An off-by-one
+    /// does not fail loudly — it shifts every owner's weekend by a day, and the
+    /// wallet works fine six days out of seven.
+    #[test]
+    fn allowed_days_is_an_iso_weekday_counted_from_a_thursday_epoch() {
+        let weekdays = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_days": [1, 2, 3, 4, 5] } }
+        }));
+        assert_eq!(evaluate(&weekdays, &transfer("1"), None, MON_NOON), Decision::Allow, "Monday is 1");
+        assert_eq!(evaluate(&weekdays, &transfer("1"), None, FRI_NOON), Decision::Allow, "Friday is 5");
+        match evaluate(&weekdays, &transfer("1"), None, SUN_NOON) {
+            Decision::Deny { reason } => assert!(
+                reason.contains('7'),
+                "the refusal must name the day it read, or a timezone argument has nowhere to start: {reason}"
+            ),
+            d => panic!("Sunday is not a weekday, got {d:?}"),
+        }
+
+        // Sunday-only proves the mapping rather than the exclusion: a rule that
+        // named the wrong day would still refuse the list above.
+        let sunday = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_days": [7] } }
+        }));
+        assert_eq!(evaluate(&sunday, &transfer("1"), None, SUN_NOON), Decision::Allow);
+        assert!(matches!(evaluate(&sunday, &transfer("1"), None, MON_NOON), Decision::Deny { .. }));
+
+        // Hours and days are ANDed: satisfying one is not satisfying both.
+        let both = policy_from(json!({
+            "rules": { "time_restrictions": { "allowed_hours": [9, 17], "allowed_days": [1] } }
+        }));
+        assert_eq!(evaluate(&both, &transfer("1"), None, MON_NOON), Decision::Allow);
+        assert!(
+            matches!(evaluate(&both, &transfer("1"), None, FRI_NOON), Decision::Deny { .. }),
+            "the right hour on the wrong day is the wrong time"
+        );
+    }
+
+    /// A timezone we cannot apply refuses, instead of pretending it is UTC.
+    ///
+    /// The moment chosen here is INSIDE the window when read as UTC, so a silent
+    /// fallback would look exactly like success — which is how an owner in
+    /// Berlin ends up with a wallet open through the night they meant to close.
+    #[test]
+    fn a_timezone_we_cannot_apply_refuses_instead_of_pretending_it_is_utc() {
+        let berlin = policy_from(json!({
+            "rules": { "time_restrictions": { "timezone": "Europe/Berlin", "allowed_hours": [9, 17] } }
+        }));
+        match evaluate(&berlin, &transfer("1"), None, FRI_NOON) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("Europe/Berlin"),
+                "the refusal must name the zone it could not apply: {reason}"
+            ),
+            d => panic!("an unsupported timezone was silently applied as UTC, got {d:?}"),
+        }
+
+        // Not a function of the hour: refused at 05:30 too, where the UTC
+        // reading would ALSO have refused. Otherwise this test could not tell
+        // "the zone was rejected" from "the window happened to close".
+        match evaluate(&berlin, &transfer("1"), None, FRI_0530) {
+            Decision::Deny { reason } => assert!(reason.contains("Europe/Berlin"), "{reason}"),
+            d => panic!("got {d:?}"),
+        }
+
+        // Written out, UTC is the same as leaving it out.
+        let utc = policy_from(json!({
+            "rules": { "time_restrictions": { "timezone": "UTC", "allowed_hours": [9, 17] } }
+        }));
+        assert_eq!(evaluate(&utc, &transfer("1"), None, FRI_NOON), Decision::Allow);
+
+        // And the zone is checked before the window, so an owner with both a
+        // bad zone and a closed window hears about the one they can fix.
+        let closed = policy_from(json!({
+            "rules": { "time_restrictions": { "timezone": "America/New_York", "allowed_hours": [1, 2] } }
+        }));
+        match evaluate(&closed, &transfer("1"), None, FRI_NOON) {
+            Decision::Deny { reason } => assert!(reason.contains("America/New_York"), "{reason}"),
+            d => panic!("got {d:?}"),
+        }
+    }
+
+    /// The hourly tx-count cap refuses the request that would be the N+1st.
+    ///
+    /// A count cap is `>=` where an amount cap is `>`: the amount rule asks what
+    /// this request would make the total, the count rule already knows. Reading
+    /// `max_per_hour: 10` as "the eleventh is fine" is the same off-by-one seen
+    /// from the other side, and it is a whole extra transaction per hour.
+    #[test]
+    fn the_hourly_tx_count_cap_refuses_the_request_that_would_be_the_n_plus_first() {
+        let at = |n: i64| usage_json(json!({}), json!({}), json!({}), n);
+
+        // The deployed spelling, which sits OUTSIDE the limits block.
+        let by_rate = policy_from(json!({ "rules": { "rate_limit": { "max_per_hour": 10 } } }));
+        assert_eq!(evaluate(&by_rate, &transfer("1"), Some(&at(9)), 0), Decision::Allow, "the tenth is the tenth");
+        match evaluate(&by_rate, &transfer("1"), Some(&at(10)), 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Rate limit"), "{reason}"),
+            d => panic!("the eleventh must be refused, got {d:?}"),
+        }
+
+        // The plan's spelling, which sits INSIDE it. Two similar knobs is one
+        // more than is safe, so each must bind on its own — an owner who set
+        // only this one is not unlimited.
+        let by_limits = policy_from(json!({ "rules": { "limits": { "hourly_tx_count": 10 } } }));
+        assert_eq!(evaluate(&by_limits, &transfer("1"), Some(&at(9)), 0), Decision::Allow);
+        assert!(matches!(evaluate(&by_limits, &transfer("1"), Some(&at(10)), 0), Decision::Deny { .. }));
+
+        // Both set: the STRICTER binds, whichever field it happens to be. A
+        // `.max()`, or a first-match, would let one field raise the other.
+        let strict_inside = policy_from(json!({
+            "rules": { "limits": { "hourly_tx_count": 3 }, "rate_limit": { "max_per_hour": 10 } }
+        }));
+        assert!(matches!(evaluate(&strict_inside, &transfer("1"), Some(&at(3)), 0), Decision::Deny { .. }));
+        let strict_outside = policy_from(json!({
+            "rules": { "limits": { "hourly_tx_count": 10 }, "rate_limit": { "max_per_hour": 3 } }
+        }));
+        assert!(matches!(evaluate(&strict_outside, &transfer("1"), Some(&at(3)), 0), Decision::Deny { .. }));
+
+        // Stateful: the keystore holds no counters, so it must not pretend to
+        // apply this one. (It is the coordinator that supplies `Some(usage)`.)
+        assert_eq!(evaluate(&by_rate, &transfer("1"), None, 0), Decision::Allow);
+        assert_eq!(evaluate(&by_limits, &transfer("1"), None, 0), Decision::Allow);
+
+        // It counts REQUESTS, not amounts, so an op carrying no amount at all
+        // is still refused once the hour is used up.
+        let no_amount = Op::Delete { beneficiary: "dest.near".into() };
+        assert!(matches!(evaluate(&by_rate, &no_amount, Some(&at(10)), 0), Decision::Deny { .. }));
+        assert!(matches!(evaluate(&by_limits, &no_amount, Some(&at(10)), 0), Decision::Deny { .. }));
+    }
+
+    /// `excluded_types` skips the multisig trigger and NOTHING else.
+    ///
+    /// It is the one field in this engine that can only ever loosen, so its
+    /// blast radius is the property worth pinning: it removes the approval
+    /// trigger for the types it names, and not one other gate.
+    #[test]
+    fn an_excluded_type_skips_the_multisig_trigger_and_nothing_else() {
+        let p = policy_from(json!({
+            "approval": { "threshold": 2, "excluded_types": ["transfer"] },
+            "rules": {
+                "limits": { "per_transaction": { "native": "100" } },
+                "addresses": { "mode": "whitelist", "list": ["dest.near"] }
+            }
+        }));
+
+        assert_eq!(evaluate(&p, &transfer("50"), None, 0), Decision::Allow, "the excluded type goes straight through");
+
+        let withdraw = Op::Withdraw { to: "dest.near".into(), amount: "50".into(), token: "native".into() };
+        assert_eq!(
+            evaluate(&p, &withdraw, None, 0),
+            Decision::RequiresApproval { threshold: 2 },
+            "a type nobody excluded still faces the threshold"
+        );
+
+        // Exclusion is not exemption. The excluded type still meets the caps...
+        assert!(matches!(evaluate(&p, &transfer("101"), None, 0), Decision::Deny { .. }));
+        // ...and the address rules.
+        let elsewhere = Op::Transfer { to: "stranger.near".into(), amount: "50".into() };
+        assert!(matches!(evaluate(&p, &elsewhere, None, 0), Decision::Deny { .. }));
+    }
+
+    /// `excluded_types` reads the aliases a policy may have been written with.
+    ///
+    /// `withdraw` and `intents_withdraw` are one operation. An owner who
+    /// excluded the spelling their dashboard showed them, and got multisig
+    /// anyway, would conclude the field does not work.
+    #[test]
+    fn excluded_types_matches_every_alias_of_the_type_it_names() {
+        let op = || Op::Withdraw { to: "dest.near".into(), amount: "1".into(), token: "native".into() };
+        for spelling in ["withdraw", "intents_withdraw"] {
+            let p = policy_from(json!({ "approval": { "threshold": 2, "excluded_types": [spelling] } }));
+            assert_eq!(evaluate(&p, &op(), None, 0), Decision::Allow, "spelling '{spelling}'");
+        }
+        // And it excludes only what it names.
+        let p = policy_from(json!({ "approval": { "threshold": 2, "excluded_types": ["withdraw"] } }));
+        assert_eq!(evaluate(&p, &transfer("1"), None, 0), Decision::RequiresApproval { threshold: 2 });
+    }
+
+    /// A capability that demands approval yields a threshold, and fails closed
+    /// when there is nobody to give it.
+    ///
+    /// Measured on `payment_check` and `raw_sign` — the two capability kinds the
+    /// GENERIC trigger never touches. On a kind that also triggers generically
+    /// (swap, confidential) both paths return the same threshold, so a test
+    /// written there cannot tell a working capability flag from an ignored one.
+    #[test]
+    fn a_capability_requiring_approval_yields_a_threshold_and_fails_closed_without_one() {
+        let check = || Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+
+        let wired = policy_from(json!({
+            "approval": { "threshold": { "required": 3 } },
+            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+        }));
+        assert_eq!(evaluate(&wired, &check(), None, 0), Decision::RequiresApproval { threshold: 3 });
+
+        // A capability behind an approval nobody can give is a misconfiguration,
+        // and the only safe reading of it is "no". Allowing it would turn a
+        // half-finished policy into a fully-open one.
+        let unwired = policy_from(json!({
+            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+        }));
+        match evaluate(&unwired, &check(), None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("approval"), "{reason}"),
+            d => panic!("a capability demanding an absent approval must deny, got {d:?}"),
+        }
+
+        // Without the flag the same capability simply allows, so the two cases
+        // above are about `requires_approval` and not about `payment_check`.
+        let plain = policy_from(json!({ "capabilities": { "payment_check": { "allowed": true } } }));
+        assert_eq!(evaluate(&plain, &check(), None, 0), Decision::Allow);
+
+        // The middle state exists for every capability that has one, not just
+        // the first one somebody tested.
+        let raw = policy_from(json!({
+            "approval": { "threshold": 2 },
+            "capabilities": { "raw_sign": { "allowed": true, "requires_approval": true } }
+        }));
+        let raw_op = Op::Raw { chain: "ethereum".into(), payload_hash: "00".repeat(32), label: None };
+        assert_eq!(evaluate(&raw, &raw_op, None, 0), Decision::RequiresApproval { threshold: 2 });
+        let raw_plain = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true } } }));
+        assert_eq!(evaluate(&raw_plain, &raw_op, None, 0), Decision::Allow);
+    }
+
+    /// `excluded_types` cannot switch off a capability's own approval.
+    ///
+    /// The generic trigger and a capability's `requires_approval` are two
+    /// separate demands decided in two separate places, and the capability is
+    /// decided FIRST. An owner who excluded a type to keep a quote flow fast
+    /// must not discover they also disarmed the approval they deliberately put
+    /// on the capability.
+    ///
+    /// `payment_check` names the property without ambiguity: it is outside the
+    /// generic trigger, so the only thing that can produce an approval here is
+    /// the capability, and the only thing `excluded_types` could do is remove it.
+    #[test]
+    fn excluded_types_cannot_switch_off_a_capability_that_demands_approval() {
+        let p = policy_from(json!({
+            "approval": { "threshold": 2, "excluded_types": ["payment_check"] },
+            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+        }));
+        let op = Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+        assert_eq!(evaluate(&p, &op, None, 0), Decision::RequiresApproval { threshold: 2 });
+
+        // The same policy on a kind that IS generically triggered: the
+        // capability speaks first, so the exclusion never gets its turn.
+        let swap_p = policy_from(json!({
+            "approval": { "threshold": 2, "excluded_types": ["swap", "intents_swap"] },
+            "capabilities": { "swap": { "allowed": true, "requires_approval": true } }
+        }));
+        let swap = Op::Swap {
+            token_in: "usdc.near".into(),
+            amount_in: "1".into(),
+            token_out: "dai.near".into(),
+            min_out: "1".into(),
+        };
+        assert_eq!(evaluate(&swap_p, &swap, None, 0), Decision::RequiresApproval { threshold: 2 });
+    }
+
+    /// When a request breaks several rules, the FIRST one checked is the one
+    /// named — and the order is a contract, not an accident.
+    ///
+    /// Getting this wrong opens no hole. It sends the owner to fix a rule that
+    /// was not the blocker, and on a partner integration that costs a day. The
+    /// test walks the whole ladder: each rung is satisfied in turn and the next
+    /// one must speak.
+    #[test]
+    fn a_request_that_breaks_several_rules_is_refused_by_the_first_rule_checked() {
+        let mut v = json!({
+            "rules": {
+                "transaction_types": ["call"],
+                "allowed_tokens": ["usdc.near"],
+                "addresses": { "mode": "whitelist", "list": ["friend.near"] },
+                "limits": { "per_transaction": { "native": "1" } },
+                "time_restrictions": { "allowed_hours": [9, 10] }
+            },
+            "approval": { "threshold": 2 }
+        });
+        // One op, breaking the type, the token, the address, the amount and the
+        // hour all at once.
+        let op = Op::Transfer { to: "stranger.near".into(), amount: "999".into() };
+        let named = |v: &serde_json::Value, expect: &str| {
+            let p = policy_from(v.clone());
+            match evaluate(&p, &op, None, FRI_NOON) {
+                Decision::Deny { reason } => assert!(
+                    reason.contains(expect),
+                    "expected the refusal to name {expect}, got: {reason}"
+                ),
+                d => panic!("expected a Deny naming {expect}, got {d:?}"),
+            }
+        };
+
+        named(&v, "Transaction type");
+        v["rules"]["transaction_types"] = json!(["transfer"]);
+        named(&v, "Token");
+        v["rules"]["allowed_tokens"] = json!(["*"]);
+        named(&v, "whitelist");
+        v["rules"]["addresses"]["list"] = json!(["stranger.near"]);
+        named(&v, "Per-transaction");
+        v["rules"]["limits"]["per_transaction"]["native"] = json!("1000");
+        named(&v, "hour");
+        // No hour restriction is the ABSENCE of the field: `[start, end]` is a
+        // half-open window and has no "all day" spelling.
+        v["rules"]["time_restrictions"] = json!({});
+
+        // With every refusal answered, the threshold that was behind all of
+        // them finally speaks. Reaching it proves the ladder was walked and not
+        // merely re-entered at the top each time.
+        let p = policy_from(v);
+        assert_eq!(evaluate(&p, &op, None, FRI_NOON), Decision::RequiresApproval { threshold: 2 });
+    }
+
+    /// A frozen wallet says only that it is frozen.
+    ///
+    /// Freeze is the controller's hard stop. A refusal naming some lesser rule
+    /// invites the agent to retry around it, and an agent that retries around a
+    /// freeze is exactly what a freeze exists to stop.
+    #[test]
+    fn a_frozen_wallet_says_only_that_it_is_frozen() {
+        let p = policy_from(json!({
+            "frozen": true,
+            "rules": {
+                "transaction_types": ["call"],
+                "addresses": { "mode": "whitelist", "list": ["friend.near"] },
+                "limits": { "per_transaction": { "native": "1" }, "daily": { "native": "not a number" } },
+                "time_restrictions": { "timezone": "Mars/Olympus" }
+            },
+            "approval": { "threshold": 2 }
+        }));
+        let op = Op::Transfer { to: "stranger.near".into(), amount: "999".into() };
+        assert_eq!(evaluate(&p, &op, None, FRI_NOON), Decision::Frozen);
+
+        // Including over the unreadable-policy refusal, which is otherwise the
+        // earliest thing checked and would be a plausible answer here.
+        assert_eq!(evaluate(&p, &transfer("1"), None, 0), Decision::Frozen);
+
+        // And including the identity proofs an unfrozen wallet always allows.
+        let auth = Op::Auth { purpose: "bearer".into(), seed: "s".into(), vault_id: None };
+        assert_eq!(evaluate(&p, &auth, None, 0), Decision::Frozen);
+    }
+
+    /// The windows are separate purses, and the refusal names the one that is full.
+    ///
+    /// An owner told "Daily" when the month is what ran out waits for midnight
+    /// and stays blocked.
+    #[test]
+    fn the_windows_are_separate_purses_and_the_refusal_names_the_full_one() {
+        let p = policy_from(json!({
+            "rules": { "limits": { "daily": { "native": "100" }, "monthly": { "native": "150" } } }
+        }));
+
+        // Comfortably inside the day, past the month.
+        let month_nearly_gone = usage_json(json!({ "native": "10" }), json!({}), json!({ "native": "140" }), 0);
+        match evaluate(&p, &transfer("20"), Some(&month_nearly_gone), 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Monthly"), "{reason}"),
+            d => panic!("the monthly cap did not bind, got {d:?}"),
+        }
+
+        // The same spend against a fresh month passes, so what refused it above
+        // was the month and not the amount.
+        let fresh_month = usage_json(json!({ "native": "10" }), json!({}), json!({}), 0);
+        assert_eq!(evaluate(&p, &transfer("20"), Some(&fresh_month), 0), Decision::Allow);
+
+        // And a full day is named as the day, even while the month has room.
+        let day_gone = usage_json(json!({ "native": "95" }), json!({}), json!({ "native": "95" }), 0);
+        match evaluate(&p, &transfer("10"), Some(&day_gone), 0) {
+            Decision::Deny { reason } => assert!(reason.contains("Daily"), "{reason}"),
+            d => panic!("the daily cap did not bind, got {d:?}"),
+        }
+    }
+
+    /// Usage is read in the shape the coordinator writes it.
+    ///
+    /// `get_current_usage` builds amounts as JSON STRINGS and the tx count as a
+    /// JSON NUMBER. A suite that hand-built `Usage` would pass over a mismatch
+    /// here, and a mismatch reads as "nothing has been spent" — the direction
+    /// that disarms every velocity cap at once, silently, for every wallet.
+    #[test]
+    fn usage_is_read_in_the_shape_the_coordinator_writes_it() {
+        let u = Usage::from_current_usage(&json!({
+            "daily": { "native": "5", "usdc.near": "7" },
+            "hourly": { "native": "3" },
+            "monthly": { "native": "9" },
+            "hourly_tx_count": 4
+        }));
+        assert_eq!(u.daily.get("native").copied(), Some(5));
+        assert_eq!(u.daily.get("usdc.near").copied(), Some(7));
+        assert_eq!(u.hourly.get("native").copied(), Some(3));
+        assert_eq!(u.monthly.get("native").copied(), Some(9));
+        assert_eq!(u.hourly_tx_count, 4);
+
+        // An untouched wallet: empty maps and a zero count, which is what the
+        // query returns when no row matched the period.
+        let untouched = Usage::from_current_usage(&json!({
+            "daily": {}, "hourly": {}, "monthly": {}, "hourly_tx_count": 0
+        }));
+        assert!(untouched.daily.is_empty() && untouched.hourly_tx_count == 0);
+
+        // Yocto-scale figures survive: these are u128, and a float would have
+        // rounded a NEAR balance into an approximation of one.
+        let big = Usage::from_current_usage(&json!({
+            "daily": { "native": "340282366920938463463374607431768211455" }
+        }));
+        assert_eq!(big.daily.get("native").copied(), Some(u128::MAX));
+    }
+
+    /// Counters we could not read at all are not counters reading zero.
+    ///
+    /// The coordinator asks the database for a wallet's spend counters and,
+    /// at fifteen call sites, does `get_current_usage(...).await
+    /// .unwrap_or_default()`. That `Result<Value, _>` defaults to
+    /// `Value::Null`, which used to parse into an empty `Usage` — and an empty
+    /// `Usage` means "this wallet has spent nothing today", which is a fact
+    /// about a quiet wallet and a lie about a database that would not answer.
+    ///
+    /// A pool exhausted, a restart, a query timing out: every velocity cap in
+    /// the wallet lifts for the duration, silently, exactly when the system is
+    /// least healthy. This is the likelier sibling of the malformed-row case,
+    /// and it is caught in the READER rather than at fifteen callers, so a
+    /// sixteenth cannot reintroduce it.
+    #[test]
+    fn counters_we_could_not_read_at_all_do_not_read_as_nothing_spent() {
+        // Exactly what `unwrap_or_default()` produces on a failed query.
+        let failed = Usage::from_current_usage(&serde_json::Value::default());
+        assert!(failed.all_unreadable, "a failed read parsed as an empty wallet");
+
+        // And every other shape that is not a usage document.
+        for not_a_document in [
+            json!(null),
+            json!({}),
+            json!("nothing"),
+            json!([]),
+            json!({ "hourly_tx_count": 0 }),
+        ] {
+            assert!(
+                Usage::from_current_usage(&not_a_document).all_unreadable,
+                "{not_a_document} was read as a wallet that has spent nothing"
+            );
+        }
+
+        // A document names its windows, and one window is enough — the reader
+        // must not start refusing the partial shapes callers legitimately send.
+        for document in [
+            json!({ "daily": {} }),
+            json!({ "daily": { "native": "5" }, "hourly": {}, "monthly": {}, "hourly_tx_count": 0 }),
+        ] {
+            assert!(
+                !Usage::from_current_usage(&document).all_unreadable,
+                "{document} is a usage document and was refused as though it were not"
+            );
+        }
+
+        // What it does to a decision: a cap that applies cannot be applied, so
+        // the spend is refused rather than admitted.
+        let capped = policy_from(json!({
+            "rules": { "limits": { "daily": { "native": "100" } } }
+        }));
+        match evaluate(&capped, &transfer("1"), Some(&failed), 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("could not be read"),
+                "the refusal does not say the counters are the problem: {reason}"
+            ),
+            d => panic!("an unread counter admitted a capped spend, got {d:?}"),
+        }
+
+        // The transaction count is a counter too.
+        let rate = policy_from(json!({ "rules": { "rate_limit": { "max_per_hour": 10 } } }));
+        assert!(matches!(
+            evaluate(&rate, &transfer("1"), Some(&failed), 0),
+            Decision::Deny { .. }
+        ));
+        // Including through the `limits` spelling, which takes the other branch.
+        let inside = policy_from(json!({ "rules": { "limits": { "hourly_tx_count": 10 } } }));
+        assert!(matches!(
+            evaluate(&inside, &transfer("1"), Some(&failed), 0),
+            Decision::Deny { .. }
+        ));
+
+        // SCOPED, like every other unreadable refusal here: a wallet whose
+        // owner set no velocity rule at all is not stopped by counters nobody
+        // consults. Losing the database must not stop a wallet that never had
+        // a cap to enforce.
+        let uncapped = policy_from(json!({
+            "rules": { "addresses": { "mode": "whitelist", "list": ["dest.near"] } }
+        }));
+        assert_eq!(evaluate(&uncapped, &transfer("1"), Some(&failed), 0), Decision::Allow);
+
+        // And the decoded-effects door reads the same counters.
+        let door_policy = policy_from(json!({
+            "rules": {
+                "addresses": { "mode": "whitelist", "list": ["agent.tla", "good.near"] },
+                "limits": { "daily": { "native": "1000000000000000000000000000" } }
+            }
+        }));
+        let door = door_op(
+            r#"{"request":{"external":[{
+                "receiver_id":"good.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1000"}}]}]}}"#,
+        );
+        assert!(matches!(
+            evaluate(&door_policy, &door, Some(&failed), 0),
+            Decision::Deny { .. }
+        ));
+    }
+
+    /// A spend figure we cannot read is not a spend of nothing.
+    ///
+    /// The counters are OUR data, not the owner's, so nobody is going to notice
+    /// a malformed row by looking at their policy. Coercing it to zero is the
+    /// same failure as an unreadable cap read as "no cap", arriving from the
+    /// other side of the same comparison: the window silently stops applying,
+    /// and the wallet spends past a ceiling that still reads correctly
+    /// everywhere it is displayed.
+    #[test]
+    fn a_spend_we_could_not_read_refuses_rather_than_counting_as_zero() {
+        let p = policy_from(json!({
+            "rules": { "limits": { "daily": { "native": "100", "usdc.near": "100" } } }
+        }));
+        // The shape a coercion would hide: a stored figure that is not a whole
+        // number of the token's smallest unit.
+        let broken = Usage::from_current_usage(&json!({
+            "daily": { "native": "9.5", "usdc.near": "40" },
+            "hourly": {}, "monthly": {}, "hourly_tx_count": 0
+        }));
+        assert!(
+            broken.unreadable.contains("daily:native"),
+            "the unreadable counter was not recorded: {:?}",
+            broken.unreadable
+        );
+        assert_eq!(
+            broken.daily.get("native").copied(),
+            None,
+            "an unreadable figure must not appear as a readable one"
+        );
+
+        match evaluate(&p, &transfer("1"), Some(&broken), 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("daily") && reason.contains("native"),
+                "the refusal must name the counter that could not be read: {reason}"
+            ),
+            d => panic!("an unreadable daily spend must not read as zero spent, got {d:?}"),
+        }
+
+        // SCOPED: the token whose row is fine still transacts. One bad row is
+        // an operator's job, not a reason to stop the wallet.
+        let usdc = Op::Withdraw {
+            to: "dest.near".into(),
+            amount: "10".into(),
+            token: "usdc.near".into(),
+        };
+        assert_eq!(evaluate(&p, &usdc, Some(&broken), 0), Decision::Allow);
+
+        // And scoped to the WINDOW: a policy that caps only the month is not
+        // refused by an unreadable day.
+        let monthly_only = policy_from(json!({
+            "rules": { "limits": { "monthly": { "native": "100" } } }
+        }));
+        assert_eq!(evaluate(&monthly_only, &transfer("1"), Some(&broken), 0), Decision::Allow);
+
+        // A counter stored as a JSON number rather than a string is the same
+        // failure — and the form a naive writer would produce.
+        let as_number = Usage::from_current_usage(&json!({ "daily": { "native": 5 } }));
+        assert!(as_number.unreadable.contains("daily:native"));
+        assert!(matches!(
+            evaluate(&p, &transfer("1"), Some(&as_number), 0),
+            Decision::Deny { .. }
+        ));
+
+        // The decoded-effects path reads the same counters and must refuse too,
+        // or the door is a way past the window this fix exists to hold.
+        //
+        // Metered on a TOKEN, deliberately. The outer op of a door call is a
+        // 1-yocto native marker, so a native cap here is caught by the scalar
+        // path above whatever the door does — this assertion was first written
+        // that way and passed with the door's guard deleted. The token arm is
+        // the half that is actually observable, and the half with no second
+        // gate behind it.
+        use base64::Engine;
+        let ft = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"600000"}"#);
+        let door = door_op(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        let door_policy = policy_from(json!({
+            "rules": {
+                "addresses": { "mode": "whitelist", "list": ["agent.tla", "good.near", "token.near"] },
+                "limits": { "daily": { "token.near": "1000000" } }
+            }
+        }));
+        let token_broken = Usage::from_current_usage(&json!({
+            "daily": { "token.near": "not a number" }
+        }));
+        match evaluate(&door_policy, &door, Some(&token_broken), 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("token.near"),
+                "the door's refusal must name the counter it could not read: {reason}"
+            ),
+            d => panic!("the extension door read an unreadable counter as zero, got {d:?}"),
+        }
+        // With the counter readable the same envelope goes through, so the
+        // refusal above is the counter and not the envelope.
+        let fine = Usage::from_current_usage(&json!({ "daily": { "token.near": "1" } }));
+        assert_eq!(evaluate(&door_policy, &door, Some(&fine), 0), Decision::Allow);
+    }
+
+    /// A payment split across promises meets the WINDOW as one payment.
+    ///
+    /// The per-transaction aggregate is covered; the stateful windows read the
+    /// same total against a spend counter, which is a second comparison in a
+    /// second place. Two halves that each fit the day's remainder, and together
+    /// do not, are one request over the cap.
+    #[test]
+    fn a_payment_split_across_promises_meets_the_daily_window_as_one_payment() {
+        use base64::Engine;
+        let half = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"receiver_id":"good.near","amount":"300000"}"#);
+        let split = door_op(&format!(
+            r#"{{"request":{{"external":[
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{half}","deposit":"1"}}}}]}},
+                {{"receiver_id":"token.near","actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{half}","deposit":"1"}}}}]}}
+            ]}}}}"#
+        ));
+        let policy = policy_from(json!({
+            "rules": {
+                "addresses": { "mode": "whitelist", "list": ["agent.tla", "good.near", "token.near"] },
+                "limits": {
+                    "per_transaction": { "token.near": "1000000" },
+                    "daily": { "token.near": "1000000" }
+                }
+            }
+        }));
+
+        // 500k spent, 300k + 300k arriving, against a 1M day. Each half fits.
+        let spent = usage_json(json!({ "token.near": "500000" }), json!({}), json!({}), 0);
+        match evaluate(&policy, &split, Some(&spent), 0) {
+            Decision::Deny { reason } => assert!(
+                reason.contains("Daily") && reason.contains("token.near"),
+                "{reason}"
+            ),
+            d => panic!("two halves over the day's remainder must be refused, got {d:?}"),
+        }
+
+        // Half the prior spend and the same request fits, so the refusal above
+        // was the window and not the shape of the envelope.
+        let less_spent = usage_json(json!({ "token.near": "300000" }), json!({}), json!({}), 0);
+        assert_eq!(evaluate(&policy, &split, Some(&less_spent), 0), Decision::Allow);
+    }
+
 }

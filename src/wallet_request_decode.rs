@@ -564,6 +564,91 @@ mod tests {
     /// an ft_transfer to bob bundled with a 250 NEAR transfer. The policy
     /// must see bob, attacker AND the 250 NEAR — the triple the outer call
     /// hides entirely.
+    /// A refusal to decode says WHICH part it could not read.
+    ///
+    /// The decoder is fail-closed by construction — both action enums are
+    /// internally tagged, so an action we do not know takes the whole request
+    /// down rather than being skipped. That is right, and it is only half of
+    /// what a caller needs: an agent told "the request does not parse" has an
+    /// opaque blob and no next move, while one told which variant, or which
+    /// field, fixes it in a minute.
+    ///
+    /// serde already writes those sentences and `decode` passes them through
+    /// whole. This pins that, because the tempting simplification — a tidy
+    /// generic message — costs exactly the part that is worth having.
+    #[test]
+    fn a_request_we_cannot_decode_says_which_part_we_could_not_read() {
+        let msg = |wire: &str| match decode(wire.as_bytes()) {
+            Ok(_) => panic!("expected a refusal for: {wire}"),
+            Err(e) => e.to_string(),
+        };
+
+        // An action we do not implement names ITSELF and the set we do.
+        let m = msg(
+            r#"{"request":{"external":[{"receiver_id":"a.near",
+                "actions":[{"action":"stake","payload":{"amount":"1"}}]}]}}"#,
+        );
+        assert!(m.contains("stake"), "the refused action is not named: {m}");
+        for known in ["function_call", "transfer", "deterministic_state_init"] {
+            assert!(m.contains(known), "the permitted actions are not listed: {m}");
+        }
+
+        // Same for an account-control op — the class that must never be
+        // silently dropped, because dropping one is handing over the lane.
+        let m = msg(r#"{"request":{"internal":[{"op":"self_destruct","payload":{}}]}}"#);
+        assert!(m.contains("self_destruct"), "the refused op is not named: {m}");
+        assert!(m.contains("add_extension"), "the permitted ops are not listed: {m}");
+
+        // A missing field names the field.
+        let m = msg(r#"{"request":{"external":[{"actions":[]}]}}"#);
+        assert!(m.contains("receiver_id"), "the missing field is not named: {m}");
+
+        // An envelope that is not one names what it lacks, rather than
+        // reporting a syntax error about JSON that parsed perfectly.
+        let m = msg(r#"{"foo":1}"#);
+        assert!(m.contains("request"), "the missing envelope field is not named: {m}");
+
+        // A wrong TYPE names the value and what was expected. It does not name
+        // the field — serde loses that inside a tagged variant — so it gives a
+        // column instead, and that is the one case a caller has to count to.
+        // Stated here rather than left to be discovered.
+        let m = msg(
+            r#"{"request":{"external":[{"receiver_id":"a.near",
+                "actions":[{"action":"transfer","payload":{"amount":5}}]}]}}"#,
+        );
+        assert!(m.contains("integer `5`") && m.contains("expected a string"), "{m}");
+        assert!(m.contains("column"), "with no field name, the position is all there is: {m}");
+
+        // And every one of them is prefixed with the method, so a refusal read
+        // out of a log says which door it came from.
+        for wire in [
+            r#"{"request":{"external":[{"receiver_id":"a.near","actions":[{"action":"stake","payload":{}}]}]}}"#,
+            r#"{"foo":1}"#,
+            "nonsense",
+        ] {
+            assert!(
+                msg(wire).starts_with("w_execute_extension args do not parse:"),
+                "the refusal does not say which call it is about: {}",
+                msg(wire)
+            );
+        }
+
+        // An amount that IS a string but not a number is caught later, in
+        // `effects`, and that one DOES name the field — the two paths together
+        // cover both spellings of the same mistake.
+        let envelope = decode(
+            r#"{"request":{"external":[{"receiver_id":"a.near",
+                "actions":[{"action":"transfer","payload":{"amount":"1.5"}}]}]}}"#
+                .as_bytes(),
+        )
+        .expect("a string amount decodes; it is `effects` that judges it");
+        let e = effects(&envelope, 0).expect_err("1.5 is not a yocto amount");
+        assert!(
+            e.to_string().contains("transfer amount") && e.to_string().contains("1.5"),
+            "the unreadable amount is not named: {e}"
+        );
+    }
+
     #[test]
     fn the_spec_example_yields_bob_attacker_and_250_near() {
         let ft_args = b64(r#"{"receiver_id":"bob.near","amount":"1000000"}"#);
