@@ -197,18 +197,39 @@ pub enum VerifiedState {
     PersonalAccount { code_hash: [u8; 32] },
 }
 
-/// Why a binding must not be treated as live. Grouped by how the lifecycle
-/// reacts: terminal (the binding is over), reversible (suspend and re-check),
-/// and evidence problems (always refuse, never guess).
+/// Why a binding must not be treated as live.
+///
+/// Three groups, and the group is the first thing to read: what BOTH modes
+/// can raise, what only the partner's leased mode (`hos_lease`) can raise,
+/// and what is a problem with the evidence itself rather than with the
+/// account. The personal mode has exactly one lifecycle event — the owner
+/// cut the executor — plus the code-hash check; everything under the
+/// `hos_lease` heading comes from the partner's contract views
+/// (`hos_agent_status`, `nft_item_info`, the collection's `nft_token`) and
+/// is never produced for a `personal_account` binding.
+///
+/// Within a group the lifecycle reacts by [`BindingFault::is_terminal`]:
+/// terminal ends the binding, reversible suspends it and re-checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingFault {
+    // ── Both modes ────────────────────────────────────────────────────────
     /// The executor is not (or no longer) in the account's extension set.
     /// Terminal in both modes — for `personal_account` it is the ONLY
     /// lifecycle event that exists.
     ExtensionDisabled,
-    /// `hos_lease`: the lease ran out; the account is reclaimable.
+    /// The account runs code this coordinator does not recognize: for
+    /// `personal_account` a hash outside [`WALLET_CODE_HASHES`] (a redeploy,
+    /// a wipe, a stranger's contract with familiar method names); for
+    /// `hos_lease` an implementation outside the admin-managed allowlist.
+    /// Reversible: the owner may restore the recognized code, or the
+    /// allowlist may learn the new one. Carries the observed hash, base58,
+    /// for the log line.
+    CodeHashUnknown(String),
+
+    // ── `hos_lease` only — the partner's leased accounts ──────────────────
+    /// The lease ran out; the account is reclaimable.
     LeaseExpired,
-    /// `hos_lease`: the status reports the account itself as expired.
+    /// The status reports the account itself as expired.
     ///
     /// Defensive: the `OperatingState` this build knows has no such variant
     /// (an ended lease arrives as `lease_until_ns`), so today only a future
@@ -216,18 +237,22 @@ pub enum BindingFault {
     /// does the answer is "the lane is over" rather than the reversible
     /// `StateNotActive` the catch-all would give it.
     StateExpired,
-    /// `hos_lease`: recovery or a manual freeze; reversible.
+    /// Recovery or a manual freeze; reversible.
     Frozen(String),
-    /// `hos_lease`: `Parked` / `Suspended` / anything not `Active`.
+    /// `Parked` / `Suspended` / anything not `Active`.
     StateNotActive(String),
-    /// `hos_lease`: the account migrated to an implementation this build has
-    /// no decoder for.
+    /// The account migrated to an implementation this build has no decoder
+    /// for.
     ImplVersionUnsupported(u32),
-    /// `personal_account`: the account's code hash is not in
-    /// [`WALLET_CODE_HASHES`] — a redeploy, a wipe, or a stranger's contract
-    /// with familiar method names. Reversible: the owner may restore the
-    /// recognized code. Carries the observed hash, base58, for the log line.
-    CodeHashUnknown(String),
+    /// The account's own `nft_item_info` and its collection's `nft_token` do
+    /// not agree — a different owner, a different token, or no such token at
+    /// all. The account is the party being judged, so it does not get the
+    /// last word on who owns it; the collection does. Reversible: a registry
+    /// can trail the account by a block, and a live lane must not be ended
+    /// over that lag. Carries what disagreed, for the log line.
+    RegistryDisagrees(String),
+
+    // ── Evidence problems, either mode ────────────────────────────────────
     /// The observation handed to [`admit`] belongs to the OTHER mode — a
     /// plumbing bug or a raced kind change. Refuse; never evaluate one
     /// mode's evidence under the other mode's rules.
@@ -252,6 +277,7 @@ impl BindingFault {
             BindingFault::CodeHashUnknown(_) => "unrecognized_wallet_code",
             BindingFault::EvidenceMismatch => "binding_evidence_mismatch",
             BindingFault::Malformed(_) => "chain_status_unreadable",
+            BindingFault::RegistryDisagrees(_) => "registry_disagrees",
         }
     }
 
@@ -273,7 +299,8 @@ impl BindingFault {
             | BindingFault::Malformed(_) => true,
             BindingFault::Frozen(_)
             | BindingFault::StateNotActive(_)
-            | BindingFault::CodeHashUnknown(_) => false,
+            | BindingFault::CodeHashUnknown(_)
+            | BindingFault::RegistryDisagrees(_) => false,
         }
     }
 }
@@ -299,6 +326,9 @@ impl std::fmt::Display for BindingFault {
             }
             BindingFault::Malformed(what) => {
                 write!(f, "unreadable field in the chain status: {what}")
+            }
+            BindingFault::RegistryDisagrees(what) => {
+                write!(f, "the account's collection does not confirm what the account says about itself: {what}")
             }
         }
     }
@@ -1049,6 +1079,7 @@ mod tests {
             BindingFault::Frozen("AuthorityFrozen".into()),
             BindingFault::StateNotActive("Parked".into()),
             BindingFault::CodeHashUnknown("x".into()),
+            BindingFault::RegistryDisagrees("x".into()),
         ];
         let terminal = [
             BindingFault::ExtensionDisabled,
