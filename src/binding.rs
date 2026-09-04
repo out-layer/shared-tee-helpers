@@ -244,12 +244,13 @@ pub enum BindingFault {
     /// The account migrated to an implementation this build has no decoder
     /// for.
     ImplVersionUnsupported(u32),
-    /// The account's own `nft_item_info` and its collection's `nft_token` do
-    /// not agree — a different owner, a different token, or no such token at
-    /// all. The account is the party being judged, so it does not get the
-    /// last word on who owns it; the collection does. Reversible: a registry
-    /// can trail the account by a block, and a live lane must not be ended
-    /// over that lag. Carries what disagreed, for the log line.
+    /// The collection the account says it belongs to has no record of the
+    /// token the account names — `nft_token` answered `null`, refused, or
+    /// spoke of a different token. That is the one thing a collection can
+    /// vouch for: that it MINTED the name. Ownership is not compared; it
+    /// lives on the item and the item is authoritative for it. Reversible: a
+    /// registry can trail the account by a block, and a live lane must not
+    /// be ended over that lag. Carries what was missing, for the log line.
     RegistryDisagrees(String),
 
     // ── Evidence problems, either mode ────────────────────────────────────
