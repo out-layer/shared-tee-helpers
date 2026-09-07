@@ -593,7 +593,8 @@ impl BindingProfile for PersonalAccount {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusQuery {
     /// `hos_agent_status(executor)` on the asset account. The caller that
-    /// tracks lifecycle additionally pins/compares `nft_item_info().rotation_seq`.
+    /// tracks lifecycle additionally pins/compares the item's rotation identity
+    /// (`nft_item_info().owner_id`, `rotation_epoch`, `rotation_seq`).
     HosAgentStatus,
     /// `w_is_extension_enabled(executor)` + the account's code hash.
     ExtensionAndCodeHash,
