@@ -5,13 +5,15 @@
 //!
 //! * [`HosLease`] — the partner mode: a leased, keyless House-of-Stake wallet
 //!   account (`agent.tla`). On-chain spend grants, lease, freeze, ownership
-//!   rotation. Versioned by `impl_version` against [`hos::DECODER_FOR_IMPL`].
+//!   rotation. The `impl_version` it reports maps to a decoder in the
+//!   coordinator's table; this crate only carries the decoders ([`hos::DECODERS`]).
 //! * [`PersonalAccount`] — the owner's own `user.near` with the upstream
 //!   no-sign wallet contract installed by the owner personally. No grants, no
 //!   lease, no rotation; the only lifecycle event is the executor vanishing
 //!   from the extension set, and the only spending wall is our policy.
-//!   Versioned by the account's wasm code hash against
-//!   [`WALLET_CODE_HASHES`] — the client never declares a version.
+//!   Recognized by the account's wasm code hash against the coordinator's
+//!   `wallet_code_hashes` table — the client never declares a version, and
+//!   the observer states whether the hash it read is recognized.
 //!
 //! Three rules make confusing the modes impossible rather than forbidden:
 //!
@@ -68,23 +70,17 @@ impl BindingKind {
 // Version registries
 // ============================================================================
 
-/// Wasm code hashes of wallet contracts the [`PersonalAccount`] profile
-/// accepts, sha256 of the exact published artifact. The analogue of
-/// [`hos::DECODER_FOR_IMPL`]: it compiles into the measured keystore image,
-/// so nothing outside the enclave can teach us to trust other code.
+/// The wallet build the [`PersonalAccount`] profile was written against:
+/// defuse-wallet-no-sign @ 6095765f (near/intents), built with the crate's
+/// pinned toolchain (rust 1.97.1) and the flags from its
+/// `[package.metadata.near.reproducible_build]`.
 ///
-/// An account whose code hash is not in this list fails verification — that
-/// covers a redeployed account, a wiped account, and a stranger's contract
-/// that merely copies the method names.
-pub const WALLET_CODE_HASHES: &[[u8; 32]] = &[
-    // defuse-wallet-no-sign @ 6095765f (near/intents), built with the crate's
-    // pinned toolchain (rust 1.97.1) and the flags from its
-    // `[package.metadata.near.reproducible_build]`.
-    WALLET_NO_SIGN_6095765F,
-];
-
-/// See [`WALLET_CODE_HASHES`]. Named so reports and tests can reference the
-/// specific artifact.
+/// A documented artifact, not an allowlist. Which builds a deployment
+/// recognizes is the coordinator's `wallet_code_hashes` table (seeded with
+/// this one), and the observer that reads an account's hash states in
+/// [`PlainStatus::code_recognized`] whether the table holds it. Kept here so
+/// reports and tests can name the exact bytes, and so the reproduction below
+/// stays next to the hash it produces.
 ///
 /// * sha256 hex: `a299f8ce42ee728d4dd7dede98fde3aea966e8f9c4c18e4e29086d3a7282ee66`
 /// * base58 (as `view_account.code_hash` reports it): `BwjDnyemmBhrCyuviDGpoQAm9mdjTfrX7ZjqgZB4MHvM`
@@ -172,17 +168,12 @@ pub struct PlainStatus {
     pub extension_enabled: bool,
     /// The account's current wasm code hash (raw 32 bytes).
     pub code_hash: [u8; 32],
-}
-
-/// Version evidence, one variant per mode. Each profile's
-/// [`BindingProfile::version_gate`] accepts exactly its own variant and
-/// refuses the other — version claims cannot cross modes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChainVersion {
-    /// `hos_lease`: the `impl_version` the asset account reports.
-    ImplVersion(u32),
-    /// `personal_account`: the account's wasm code hash.
-    CodeHash([u8; 32]),
+    /// Whether `code_hash` is a wallet build the deployment recognizes — the
+    /// observer's answer from the coordinator's `wallet_code_hashes` table,
+    /// stated alongside the hash because this crate holds no list of its
+    /// own. An observer that cannot answer says `false` and the verdict is
+    /// the reversible [`BindingFault::CodeHashUnknown`], never a pass.
+    pub code_recognized: bool,
 }
 
 /// What a successful verification proved. Carried forward so later stages
@@ -218,9 +209,9 @@ pub enum BindingFault {
     /// lifecycle event that exists.
     ExtensionDisabled,
     /// The account runs code this coordinator does not recognize: for
-    /// `personal_account` a hash outside [`WALLET_CODE_HASHES`] (a redeploy,
-    /// a wipe, a stranger's contract with familiar method names); for
-    /// `hos_lease` an implementation outside the admin-managed allowlist.
+    /// `personal_account` a hash outside the deployment's `wallet_code_hashes`
+    /// (a redeploy, a wipe, a stranger's contract with familiar method
+    /// names); for `hos_lease` an implementation outside `hos_impl_code_hashes`.
     /// Reversible: the owner may restore the recognized code, or the
     /// allowlist may learn the new one. Carries the observed hash, base58,
     /// for the log line.
@@ -357,10 +348,6 @@ pub trait BindingProfile: sealed::Sealed {
 
     /// Read the evidence fail-closed. `Ok` means the lane is live RIGHT NOW.
     fn verify(status: &Self::ChainStatus, now_ns: u64) -> Result<VerifiedState, BindingFault>;
-
-    /// Gate the mode's version evidence to a decoder version. Refuses the
-    /// other mode's evidence variant.
-    fn version_gate(version: &ChainVersion) -> Result<u32, BindingFault>;
 
     /// The mode's OWN rules over the decoded effects — grants and call-form
     /// for the leased mode, nothing for the personal one. Runs AFTER the
@@ -531,7 +518,7 @@ impl BindingProfile for PersonalAccount {
         // wiped account — whose membership view does not even exist, so it
         // reads as `false` — with the terminal fault, ending a binding the
         // owner could have restored.
-        if !WALLET_CODE_HASHES.contains(&status.code_hash) {
+        if !status.code_recognized {
             return Err(BindingFault::CodeHashUnknown(
                 bs58::encode(status.code_hash).into_string(),
             ));
@@ -542,24 +529,6 @@ impl BindingProfile for PersonalAccount {
         Ok(VerifiedState::PersonalAccount {
             code_hash: status.code_hash,
         })
-    }
-
-    fn version_gate(version: &ChainVersion) -> Result<u32, BindingFault> {
-        match version {
-            ChainVersion::CodeHash(h) => {
-                if WALLET_CODE_HASHES.contains(h) {
-                    // One recognized build, one decoder. When a second build
-                    // lands in the allowlist with a different wire format,
-                    // this becomes a lookup like DECODER_FOR_IMPL.
-                    Ok(1)
-                } else {
-                    Err(BindingFault::CodeHashUnknown(
-                        bs58::encode(h).into_string(),
-                    ))
-                }
-            }
-            ChainVersion::ImplVersion(_) => Err(BindingFault::EvidenceMismatch),
-        }
     }
 
     /// Deliberately empty — and kept empty. The personal mode has no grants,
@@ -728,7 +697,7 @@ pub fn verdict(
 pub fn signing_version_gate(
     method: &str,
     kind: Option<&str>,
-    impl_version: Option<u32>,
+    decoder_version: Option<u32>,
 ) -> Result<(), String> {
     if method != "w_execute_extension" {
         return Ok(());
@@ -742,20 +711,30 @@ pub fn signing_version_gate(
     };
     match kind {
         BindingKind::HosLease => {
-            let Some(version) = impl_version else {
+            let Some(decoder) = decoder_version else {
                 return Err(
-                    "the leased mode must state the wallet implementation version it runs; \
-                     refusing to sign a nested request whose schema is unstated"
+                    "the leased mode must state which decoder reads the bound account's \
+                     nested requests; refusing to sign a request whose schema is unstated"
                         .to_string(),
                 );
             };
-            HosLease::version_gate(&ChainVersion::ImplVersion(version))
-                .map(|_| ())
-                .map_err(|fault| fault.to_string())
+            if crate::hos::decoder_supported(decoder) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "nested-request decoder {decoder} is not carried by this build (carried: {}); \
+                     refusing to sign a request this build cannot read",
+                    crate::hos::DECODERS
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
         }
-        // Versioned by the account's wasm code hash, which this enclave cannot
-        // read. Pinned in `WALLET_CODE_HASHES` in this image and checked
-        // against the chain by the components that can.
+        // Recognized by the account's wasm code hash, which this enclave cannot
+        // read; the components that can hold it against the coordinator's
+        // `wallet_code_hashes` table.
         BindingKind::PersonalAccount => Ok(()),
     }
 }
@@ -800,7 +779,10 @@ mod tests {
     }
 
     fn recognized_hash() -> [u8; 32] {
-        WALLET_CODE_HASHES[0]
+        WALLET_NO_SIGN_6095765F
+    }
+    fn recognized() -> PlainStatus {
+        PlainStatus { extension_enabled: true, code_hash: recognized_hash(), code_recognized: true }
     }
 
     /// Only the files that DISPATCH may name a mode. Everything else in this
@@ -887,10 +869,7 @@ mod tests {
     #[test]
     fn admit_dispatches_each_kind_to_its_own_profile() {
         let hos_obs = ChainObservation::HosLease(healthy_hos());
-        let personal_obs = ChainObservation::PersonalAccount(PlainStatus {
-            extension_enabled: true,
-            code_hash: recognized_hash(),
-        });
+        let personal_obs = ChainObservation::PersonalAccount(recognized());
 
         assert!(matches!(
             admit(BindingKind::HosLease, &hos_obs, 1000),
@@ -907,10 +886,7 @@ mod tests {
         // A lying kind hint may only deny: hos evidence under the personal
         // profile (and vice versa) never reaches either verifier.
         let hos_obs = ChainObservation::HosLease(healthy_hos());
-        let personal_obs = ChainObservation::PersonalAccount(PlainStatus {
-            extension_enabled: true,
-            code_hash: recognized_hash(),
-        });
+        let personal_obs = ChainObservation::PersonalAccount(recognized());
         assert_eq!(
             admit(BindingKind::PersonalAccount, &hos_obs, 1000),
             Err(BindingFault::EvidenceMismatch)
@@ -923,23 +899,24 @@ mod tests {
 
     #[test]
     fn a_personal_binding_needs_membership_and_a_recognized_hash() {
-        let ok = PlainStatus { extension_enabled: true, code_hash: recognized_hash() };
+        let ok = recognized();
         assert!(matches!(
             PersonalAccount::verify(&ok, 0),
             Ok(VerifiedState::PersonalAccount { .. })
         ));
 
         // Removed from the extension set — the mode's one revocation event.
-        let removed = PlainStatus { extension_enabled: false, code_hash: recognized_hash() };
+        let removed = PlainStatus { extension_enabled: false, ..recognized() };
         assert_eq!(
             PersonalAccount::verify(&removed, 0),
             Err(BindingFault::ExtensionDisabled)
         );
 
         // A stranger's contract with the same method names: same view answers
-        // `true`, but the hash gives it away. This is the whole reason the
-        // allowlist exists.
-        let impostor = PlainStatus { extension_enabled: true, code_hash: [0xAB; 32] };
+        // `true`, but the hash gives it away — the observer found it in no
+        // list. This is the whole reason the allowlist exists.
+        let impostor =
+            PlainStatus { extension_enabled: true, code_hash: [0xAB; 32], code_recognized: false };
         assert!(matches!(
             PersonalAccount::verify(&impostor, 0),
             Err(BindingFault::CodeHashUnknown(_))
@@ -949,7 +926,8 @@ mod tests {
         // account takes, because a contract without our methods cannot answer
         // the membership view at all. The CODE must be the answer: it is
         // reversible, and `ExtensionDisabled` would end the binding for good.
-        let redeployed = PlainStatus { extension_enabled: false, code_hash: [0xAB; 32] };
+        let redeployed =
+            PlainStatus { extension_enabled: false, code_hash: [0xAB; 32], code_recognized: false };
         assert!(
             matches!(
                 PersonalAccount::verify(&redeployed, 0),
@@ -957,27 +935,6 @@ mod tests {
             ),
             "a redeployed account must be recoverable, not terminally revoked"
         );
-    }
-
-    #[test]
-    fn version_evidence_cannot_cross_modes() {
-        assert_eq!(
-            PersonalAccount::version_gate(&ChainVersion::ImplVersion(6)),
-            Err(BindingFault::EvidenceMismatch)
-        );
-        assert_eq!(
-            HosLease::version_gate(&ChainVersion::CodeHash(recognized_hash())),
-            Err(BindingFault::EvidenceMismatch)
-        );
-        assert_eq!(
-            PersonalAccount::version_gate(&ChainVersion::CodeHash(recognized_hash())),
-            Ok(1)
-        );
-        assert_eq!(HosLease::version_gate(&ChainVersion::ImplVersion(6)), Ok(1));
-        assert!(matches!(
-            HosLease::version_gate(&ChainVersion::ImplVersion(5)),
-            Err(BindingFault::ImplVersionUnsupported(5))
-        ));
     }
 
     #[test]
@@ -1049,7 +1006,7 @@ mod tests {
         // Found by the live kit probe: UseGlobalContract leaves code_hash at
         // the zero sentinel and reports the real hash elsewhere. Reading only
         // code_hash refused every account installed the recommended way.
-        let pinned = bs58::encode(WALLET_CODE_HASHES[0]).into_string();
+        let pinned = bs58::encode(WALLET_NO_SIGN_6095765F).into_string();
 
         // Inline deploy: code_hash carries the truth.
         assert_eq!(
@@ -1135,30 +1092,33 @@ mod tests {
     }
 
     #[test]
-    fn the_enclave_refuses_to_sign_for_an_unstated_or_unknown_implementation() {
+    fn the_enclave_refuses_to_sign_for_an_unstated_or_uncarried_decoder() {
         // Ordinary operations carry no nested request — nothing to gate.
         assert!(signing_version_gate("ft_transfer", None, None).is_ok());
         assert!(signing_version_gate("storage_deposit", Some("hos_lease"), None).is_ok());
 
-        // The door, leased mode: the version must be stated AND supported.
-        assert!(signing_version_gate("w_execute_extension", Some("hos_lease"), Some(6)).is_ok());
-        assert!(signing_version_gate("w_execute_extension", Some("hos_lease"), Some(5)).is_err());
+        // The door, leased mode: the decoder must be stated AND carried. The
+        // number is the DECODER the coordinator resolved from its table, not
+        // the partner's impl_version — a renumbered implementation that reads
+        // by the same decoder does not reach this gate at all.
+        assert!(signing_version_gate("w_execute_extension", Some("hos_lease"), Some(1)).is_ok());
+        assert!(signing_version_gate("w_execute_extension", Some("hos_lease"), Some(2)).is_err());
         assert!(
             signing_version_gate("w_execute_extension", Some("hos_lease"), None).is_err(),
-            "an unstated version must refuse, not default to the one decoder we happen to have"
+            "an unstated decoder must refuse, not default to the one we happen to have"
         );
 
         // No kind means the partner mode — same demand, so a dropped field
         // cannot become a way around the gate.
         assert!(signing_version_gate("w_execute_extension", None, None).is_err());
-        assert!(signing_version_gate("w_execute_extension", None, Some(6)).is_ok());
+        assert!(signing_version_gate("w_execute_extension", None, Some(1)).is_ok());
 
-        // The personal mode states no version: its code hash is pinned in this
-        // image and verified against the chain elsewhere.
+        // The personal mode states no decoder: its code hash is held against
+        // the coordinator's table by the components that can read the chain.
         assert!(signing_version_gate("w_execute_extension", Some("personal_account"), None).is_ok());
 
         // A kind this build does not know is a refusal, never a guess.
-        assert!(signing_version_gate("w_execute_extension", Some("delegation"), Some(6)).is_err());
+        assert!(signing_version_gate("w_execute_extension", Some("delegation"), Some(1)).is_err());
     }
 
     #[test]

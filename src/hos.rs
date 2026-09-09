@@ -14,24 +14,28 @@
 use serde::{Deserialize, Serialize};
 
 use crate::binding::{
-    BindingFault, BindingKind, BindingProfile, ChainVersion, HosLease, Stage, VerifiedState,
+    BindingFault, BindingKind, BindingProfile, HosLease, Stage, VerifiedState,
     Violation,
 };
 use crate::wallet_request_decode::{EffectsSet, ShapeFact, TokenAmount};
 
-/// `(impl_version, decoder_version)` pairs this build can evaluate.
+/// The nested-request decoders this build carries.
 ///
-/// Versions below 6 are absent on purpose: their grants did not bound token
-/// movement on chain, so no lane we would open against them is acceptable.
-pub const DECODER_FOR_IMPL: &[(u32, u32)] = &[(6, 1)];
+/// A decoder is CODE — the frozen wire structs of one `w_execute_extension`
+/// request schema — and it belongs in the measured image: nothing outside the
+/// enclave can teach it to read a shape it was not built for. Which partner
+/// `impl_version` a decoder reads is DATA, and lives in the coordinator's
+/// `hos_impl_versions` table: the partner renumbers on every redeploy, schema
+/// change or not, and a mapping pinned here made each of their releases a
+/// release of ours. The enclave asks one question of a signing request —
+/// "is the decoder the coordinator resolved one I carry?" — and refuses
+/// otherwise (fail closed: a schema read by the wrong decoder parses and
+/// means something else).
+pub const DECODERS: &[u32] = &[1];
 
-/// The decoder that evaluates `impl_version`, or `None` when the version is
-/// unsupported (fail closed — the caller must refuse, not guess).
-pub fn decoder_for(impl_version: u32) -> Option<u32> {
-    DECODER_FOR_IMPL
-        .iter()
-        .find(|(impl_v, _)| *impl_v == impl_version)
-        .map(|(_, decoder)| *decoder)
+/// Whether this build carries `decoder_version`.
+pub fn decoder_supported(decoder_version: u32) -> bool {
+    DECODERS.contains(&decoder_version)
 }
 
 /// `hos_agent_status(extension)` on the asset account — everything needed
@@ -102,21 +106,13 @@ impl BindingProfile for HosLease {
         if lease_until <= now_ns {
             return Err(BindingFault::LeaseExpired);
         }
-        if decoder_for(status.impl_version).is_none() {
-            return Err(BindingFault::ImplVersionUnsupported(status.impl_version));
-        }
+        // `impl_version` is NOT judged here. Whether this build reads that
+        // version is a lookup in the coordinator's `hos_impl_versions` table,
+        // made by the caller around this verdict; the crate only knows which
+        // decoders it carries (`DECODERS`).
         Ok(VerifiedState::HosLease {
             status: status.clone(),
         })
-    }
-
-    fn version_gate(version: &ChainVersion) -> Result<u32, BindingFault> {
-        match version {
-            ChainVersion::ImplVersion(v) => {
-                decoder_for(*v).ok_or(BindingFault::ImplVersionUnsupported(*v))
-            }
-            ChainVersion::CodeHash(_) => Err(BindingFault::EvidenceMismatch),
-        }
     }
 
     /// The leased mode's own layer over the decoded effects: the grant, the
@@ -597,44 +593,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_healthy_status_passes_and_each_fault_is_named() {
-        assert!(matches!(
-            verify(&healthy(), 1000),
-            Ok(VerifiedState::HosLease { .. })
-        ));
-
-        let mut s = healthy();
-        s.extension_enabled = false;
-        assert_eq!(verify(&s, 1000), Err(BindingFault::ExtensionDisabled));
-
-        let mut s = healthy();
-        s.frozen = "Frozen".into();
-        assert_eq!(verify(&s, 1000), Err(BindingFault::Frozen("Frozen".into())));
-
-        let mut s = healthy();
-        s.state = "Parked".into();
-        assert_eq!(
-            verify(&s, 1000),
-            Err(BindingFault::StateNotActive("Parked".into()))
-        );
-
-        let mut s = healthy();
-        s.state = "Expired".into();
-        assert_eq!(verify(&s, 1000), Err(BindingFault::StateExpired));
-
-        let mut s = healthy();
-        s.lease_until_ns = "999".into();
-        assert_eq!(verify(&s, 1000), Err(BindingFault::LeaseExpired));
-
-        let mut s = healthy();
-        s.impl_version = 5;
-        assert_eq!(
-            verify(&s, 1000),
-            Err(BindingFault::ImplVersionUnsupported(5))
-        );
-    }
-
+    
     /// The LIVE `hos_agent_status` from the partner's testnet account
     /// `alpha.tlademo.testnet`, executor
     /// `5356b2c0…e325806a`, captured 2026-08-22 by an RPC `call_function`.
@@ -998,7 +957,7 @@ mod tests {
         // form is legal there, and this asymmetry is the differential subject.
         let personal = crate::binding::PersonalAccount::admission(
             &fx,
-            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_CODE_HASHES[0] },
+            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_NO_SIGN_6095765F },
             1000,
         );
         assert!(personal.is_empty(), "{personal:?}");
@@ -1203,7 +1162,7 @@ mod tests {
         // contract never parses these arguments.
         let personal = crate::binding::PersonalAccount::admission(
             &with_msg,
-            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_CODE_HASHES[0] },
+            &VerifiedState::PersonalAccount { code_hash: crate::binding::WALLET_NO_SIGN_6095765F },
             1000,
         );
         assert!(personal.is_empty(), "{personal:?}");
@@ -1313,11 +1272,51 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_supports_exactly_version_six() {
-        assert_eq!(decoder_for(6), Some(1));
-        assert_eq!(decoder_for(5), None);
-        assert_eq!(decoder_for(0), None);
-        assert_eq!(decoder_for(7), None);
+    fn a_healthy_status_passes_and_each_fault_is_named() {
+        assert!(matches!(
+            verify(&healthy(), 1000),
+            Ok(VerifiedState::HosLease { .. })
+        ));
+
+        let mut s = healthy();
+        s.extension_enabled = false;
+        assert_eq!(verify(&s, 1000), Err(BindingFault::ExtensionDisabled));
+
+        let mut s = healthy();
+        s.frozen = "Frozen".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::Frozen("Frozen".into())));
+
+        let mut s = healthy();
+        s.state = "Parked".into();
+        assert_eq!(
+            verify(&s, 1000),
+            Err(BindingFault::StateNotActive("Parked".into()))
+        );
+
+        let mut s = healthy();
+        s.state = "Expired".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::StateExpired));
+
+        let mut s = healthy();
+        s.lease_until_ns = "999".into();
+        assert_eq!(verify(&s, 1000), Err(BindingFault::LeaseExpired));
+    }
+
+    #[test]
+    fn this_build_carries_exactly_decoder_one() {
+        assert!(decoder_supported(1));
+        assert!(!decoder_supported(0));
+        assert!(!decoder_supported(2));
+    }
+
+    /// The version a leased account reports is not the crate's to judge: a
+    /// status at any `impl_version` verifies here, and the coordinator holds
+    /// it against its table. Pinned so the check does not creep back in.
+    #[test]
+    fn verify_does_not_judge_impl_version() {
+        let mut s = healthy();
+        s.impl_version = 999;
+        assert!(HosLease::verify(&s, 1000).is_ok());
     }
 }
 
