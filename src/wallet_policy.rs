@@ -325,12 +325,13 @@ pub fn canonical_json(op: &Op) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// A wallet signs with its own key, always. There are no connector sub-keys.
-//
-// If a connector ever needs to act under an address of its own, that is a
-// feature to design then, and the hard part is not the derivation: a
-// connector-scoped signature has to move the MESSAGE, the SIGNATURE and the
-// BALANCE the funds leave from to that address together.
+// A wallet signs with its own authority, always. EVM sub-keys
+// (`subkey:{id}:evm:{sub_path}` in the keystore) are separate ADDRESSES of the
+// same wallet, not separate principals: the policy below is evaluated for the
+// wallet, and no op field and no decision here depends on a sub-key path. A
+// connector-scoped PRINCIPAL — a signature that moves message, signature and
+// the balance the funds leave from to an address of the connector's own —
+// would be a different feature and is not this one.
 
 /// `sha256(canonical_json(op))` as lowercase hex.
 pub fn request_hash(op: &Op) -> String {
@@ -1609,8 +1610,9 @@ fn check_time_restrictions(tr: &TimeRestrictions, now_unix: u64) -> Option<Decis
 /// apply: an EVM signing request carries no amount/token/recipient, and the
 /// keystore neither broadcasts nor meters EVM signatures.
 ///
-/// **No connector is in this decision**: a wallet signs with its own key,
-/// always. See the note above [`request_hash`].
+/// **The decision does not depend on `sub_path`**: a sub-key is the same
+/// wallet's authority over a separate address. See the note above
+/// [`request_hash`].
 pub fn evm_sign_decision(policy: Option<&Policy>, want_raw_tx: bool, now_unix: u64) -> Decision {
     chain_sign_decision(policy, |c| c.evm_sign.as_ref(), "EVM", "evm_sign", want_raw_tx, now_unix)
 }
