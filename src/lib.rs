@@ -65,13 +65,38 @@ impl AllowedKeyTypes {
 /// Single source of truth shared by the keystore (address derivation + signing)
 /// and the coordinator (request gating) so the two can't drift on which chains
 /// are EVM. Accepts canonical long names and 1Click-style short aliases; all of
-/// these resolve to ONE derived secp256k1 address.
+/// these resolve to ONE derived secp256k1 address. `hyperevm` is Hyperliquid's
+/// EVM (chain id 999) — the custody wallet signs there like on any other EVM
+/// network; it is not a 1Click withdraw chain.
 pub fn is_evm_chain(chain: &str) -> bool {
     matches!(
         chain,
         "ethereum" | "eth" | "polygon" | "pol" | "matic" | "base" | "arbitrum" | "arb"
-            | "optimism" | "op" | "bsc" | "avalanche" | "avax"
+            | "optimism" | "op" | "bsc" | "avalanche" | "avax" | "hyperevm"
     )
+}
+
+/// Whether `path` is a well-formed wallet sub-key path: `[a-z0-9][a-z0-9._-]{0,63}`.
+///
+/// Single source of truth shared by the coordinator (refuses a malformed path
+/// before the keystore round trip) and the keystore (refuses it again before
+/// it becomes part of a seed) so the two cannot drift on what a path may
+/// contain. The empty string is NOT a valid path — callers treat absent/empty
+/// as "the wallet's own key" before asking. `:` is excluded because it is the
+/// segment separator of every keystore seed: a path that could carry it could
+/// spell a deeper level. The shape is validated, never normalised — two
+/// spellings that derive one key, or one that derives a different key than the
+/// caller wrote, would both be silent.
+pub fn is_valid_sub_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    bytes.len() <= 64
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && rest
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Whether `chain` is Solana (ed25519, seed `wallet:{id}:solana`).
@@ -387,10 +412,31 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_path_has_exactly_one_shape() {
+        for ok in ["connector.hl.trading", "0", "a", "a.b_c-d", &"a".repeat(64)] {
+            assert!(is_valid_sub_path(ok), "{ok:?} must be accepted");
+        }
+        for bad in [
+            "",
+            ".leading-dot",
+            "-leading-dash",
+            "_leading-underscore",
+            "Upper",
+            "with:colon",
+            "with space",
+            "with/slash",
+            "unicode-ё",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_valid_sub_path(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
     fn test_is_evm_chain() {
         for c in [
             "ethereum", "eth", "polygon", "pol", "matic", "base", "arbitrum", "arb", "optimism",
-            "op", "bsc", "avalanche", "avax",
+            "op", "bsc", "avalanche", "avax", "hyperevm",
         ] {
             assert!(is_evm_chain(c), "{c} should be EVM");
         }
