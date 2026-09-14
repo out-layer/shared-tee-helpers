@@ -13,8 +13,13 @@ use near_crypto::{KeyType, PublicKey, Signature};
 use rand::RngCore;
 use std::str::FromStr;
 
+pub mod access_limits;
 pub mod binding;
 pub mod hos;
+pub mod secrets_ref;
+/// NEAR's shape for an account id, for every door that takes one — not only
+/// a `secrets_ref`.
+pub use secrets_ref::account_id_is_well_formed;
 /// Golden vectors transcribed from the HoS wallet's own test suite — test-only,
 /// because their whole job is to fail when our mirror of that contract drifts.
 #[cfg(test)]
