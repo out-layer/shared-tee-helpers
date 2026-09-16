@@ -88,6 +88,11 @@ fn count(condition: &serde_json::Value) -> (usize, usize, usize) {
     if let Some(inner) = object.get("Not").and_then(|n| n.get("condition")) {
         return count(inner);
     }
+    // A `Predecessor` wrapper re-judges its condition on another account;
+    // every leaf inside it is compiled and asked exactly as it would be outside.
+    if let Some(inner) = object.get("Predecessor").and_then(|p| p.get("condition")) {
+        return count(inner);
+    }
     (0, 0, 0)
 }
 
@@ -120,6 +125,19 @@ mod a_condition_past_the_bounds_is_refused_whole {
         seventeen.push(json!({ "Not": { "condition": pattern("b\\.near") } }));
         let err = condition_bounds(&or(seventeen)).unwrap_err();
         assert!(err.contains("17 AccountPattern leaves"), "{err}");
+    }
+
+    /// A calling-account wrapper hides nothing from the count: seventeen
+    /// patterns inside one are seventeen.
+    #[test]
+    fn leaves_inside_a_predecessor_wrapper_are_counted() {
+        let seventeen: Vec<_> = (0..17).map(|i| pattern(&format!("a{i}\\.near"))).collect();
+        let wrapped = json!({ "Predecessor": { "condition": or(seventeen) } });
+        let err = condition_bounds(&wrapped).unwrap_err();
+        assert!(err.contains("17 AccountPattern leaves"), "{err}");
+        let six_reads: Vec<_> = (0..6).map(|_| json!({ "DaoMember": { "dao_contract": "d.near", "role": "council" } })).collect();
+        let err = condition_bounds(&json!({ "Predecessor": { "condition": or(six_reads) } })).unwrap_err();
+        assert!(err.contains("asks the chain 6 times"), "{err}");
     }
 
     #[test]
