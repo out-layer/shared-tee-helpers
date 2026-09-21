@@ -31,6 +31,36 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A canonical signable operation. `request_hash = sha256(canonical_json(op))`.
 ///
+/// What kind of place a limit order pays out to — 1Click's `recipientType`, in this
+/// API's spelling.
+///
+/// An enumeration and not a string, on purpose: the policy treats one of these
+/// differently from the others, and a string compared for equality lets every OTHER
+/// spelling of it through. Here a value that is not one of these does not parse, so
+/// an op carrying it never reaches the engine — and a variant added later does not
+/// compile until every `match` on it says what it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipientType {
+    /// A NEAR account credited inside NEAR Intents.
+    Intents,
+    /// The same, on the confidential shard.
+    ConfidentialIntents,
+    /// An address on the output asset's own chain.
+    DestinationChain,
+}
+
+impl RecipientType {
+    /// This API's spelling, the one the canonical op carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RecipientType::Intents => "intents",
+            RecipientType::ConfidentialIntents => "confidential_intents",
+            RecipientType::DestinationChain => "destination_chain",
+        }
+    }
+}
+
 /// Field-naming convention (single source of truth): `to` (never `receiver_id`),
 /// `amount` as a yocto/raw-unit decimal STRING (never a JSON number).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +172,40 @@ pub enum Op {
         amount: String,
         token: String,
         chain: String,
+    },
+
+    /// A limit order rested on 1Click: the wallet's intents balance funds an order that
+    /// waits at the owner's price and pays out to `to` — days later, with NO further
+    /// signature from us. That is what makes it its own kind rather than a flavour of
+    /// `Swap`: the money leaves on a schedule nobody signs for, so the decision taken HERE
+    /// is the only one there will ever be. A freeze that lands afterwards does not unwind
+    /// it; only a cancel does, and a cancel is asynchronous.
+    ///
+    /// Gated exactly like [`Op::CrossChainWithdraw`] — the `to` whitelist + the per-token
+    /// amount limit + a default-DENY `limit_order` capability — because at a price through
+    /// the market it IS that: an immediate exit to an arbitrary address. A capability that
+    /// gated the resting but not the destination would let a wallet forbidden to withdraw
+    /// send its balance anywhere by naming a bad price.
+    ///
+    /// `token_out` / `min_amount_out` carry the price — computed by the coordinator from the
+    /// request BEFORE the order exists, since the policy and the approvers need it first. An
+    /// approved order therefore binds its terms the way [`Op::Swap`] does: at most this
+    /// input, for no less than that output; the upstream's own figures are then held to them
+    /// and the order is left unfunded if they are worse. Trusted: the order's deposit address
+    /// exists only after the order is created, so it cannot be Built from the op.
+    ///
+    /// `to_type` says what kind of place `to` is ([`RecipientType`]) and is part of the terms: `bob.near` inside intents and
+    /// `bob.near` on a chain are different destinations, and approvers sign over which.
+    /// `confidential_intents` moves the output onto the confidential shard, so it ALSO
+    /// needs the `confidential` capability: an owner who never permitted confidential
+    /// operations has not permitted a limit order to be the way in.
+    LimitOrder {
+        to: String,
+        to_type: RecipientType,
+        amount: String,
+        token: String,
+        token_out: String,
+        min_amount_out: String,
     },
 
     /// Payment check (claimable-link escrow): the wallet's intents balance is moved to a
@@ -308,6 +372,7 @@ pub fn bind_mode(op: &Op) -> BindMode {
         Op::Swap { .. }
         | Op::Confidential { .. }
         | Op::CrossChainWithdraw { .. }
+        | Op::LimitOrder { .. }
         | Op::PaymentCheck { .. } => BindMode::Trusted,
         // Auth is constructed-from-op (fresh-ts auth string), like the Built kinds.
         Op::Auth { .. } => BindMode::Built,
@@ -378,6 +443,10 @@ impl Op {
             // A policy must explicitly list `cross_chain_withdraw` to permit it (default-DENY
             // / opt-in); allowing same-chain withdraw does NOT allow cross-chain.
             Op::CrossChainWithdraw { .. } => &["cross_chain_withdraw"],
+            // Its own type, like cross_chain_withdraw: permitting swaps, or even
+            // permitting cross-chain exits, does not permit resting an order that
+            // pays out unattended.
+            Op::LimitOrder { .. } => &["limit_order"],
             Op::PaymentCheck { .. } => &["payment_check"],
             Op::Swap { .. } => &["swap", "intents_swap"],
             Op::Confidential { .. } => &["confidential"],
@@ -402,6 +471,7 @@ impl Op {
             | Op::IntentsTransfer { token, .. }
             | Op::Confidential { token, .. }
             | Op::CrossChainWithdraw { token, .. }
+            | Op::LimitOrder { token, .. }
             | Op::PaymentCheck { token, .. } => token,
             Op::Swap { token_in, .. } => token_in,
             Op::Raw { .. } | Op::SignMessage { .. } | Op::Auth { .. } => "native",
@@ -417,6 +487,7 @@ impl Op {
             | Op::IntentsTransfer { amount, .. }
             | Op::Confidential { amount, .. }
             | Op::CrossChainWithdraw { amount, .. }
+            | Op::LimitOrder { amount, .. }
             | Op::PaymentCheck { amount, .. } => Some(amount),
             Op::Call { deposit, .. } => Some(deposit),
             Op::Swap { amount_in, .. } => Some(amount_in),
@@ -430,7 +501,8 @@ impl Op {
             Op::Transfer { to, .. }
             | Op::Withdraw { to, .. }
             | Op::IntentsTransfer { to, .. }
-            | Op::CrossChainWithdraw { to, .. } => Some(to),
+            | Op::CrossChainWithdraw { to, .. }
+            | Op::LimitOrder { to, .. } => Some(to),
             Op::Call { to, .. } => Some(to),
             Op::Delete { beneficiary, .. } => Some(beneficiary),
             Op::Confidential { to, .. } => to.as_deref(),
@@ -469,6 +541,7 @@ impl Op {
                 | Op::Swap { .. }
                 | Op::Confidential { .. }
                 | Op::CrossChainWithdraw { .. }
+                | Op::LimitOrder { .. }
         )
     }
 }
@@ -646,6 +719,14 @@ pub struct Capabilities {
     /// the `to` whitelist + amount limit.
     #[serde(default)]
     pub cross_chain_withdraw: Option<Capability>,
+    /// Limit orders rested on 1Click. Default-DENY, like every capability that can move
+    /// funds out: a policy that never mentions it does not permit it. Pairs with the
+    /// `limit_order` transaction type, the `to` whitelist and the per-token amount limit —
+    /// an order priced through the market executes at once, so it is gated as the exit it
+    /// can be, not as the patient thing it is named after. See [`Op::LimitOrder`] for why
+    /// the decision taken at creation is the only one that will be taken.
+    #[serde(default)]
+    pub limit_order: Option<Capability>,
     /// EVM signing (EIP-712 typed-data / EIP-191 personal_sign / raw tx).
     /// **Default-DENY under a policy** — like every other fund-moving capability,
     /// a policy must explicitly set `allowed: true` (a wallet with NO policy is
@@ -947,7 +1028,7 @@ fn evaluate_section(
             match address_mode(addresses) {
                 Err(unreadable) => return unreadable,
                 Ok(AddressMode::Whitelist) => {
-                    if !addresses.list.iter().any(|a| a == dest) {
+                    if !addresses.list.iter().any(|a| same_address(a, dest)) {
                         return deny(format!(
                             "Address '{}' is not in whitelist{}",
                             dest,
@@ -960,7 +1041,7 @@ fn evaluate_section(
                 // they can act on. The note exists for the whitelist, where the
                 // refused account is one they never wrote down.
                 Ok(AddressMode::Blacklist) => {
-                    if addresses.list.iter().any(|a| a == dest) {
+                    if addresses.list.iter().any(|a| same_address(a, dest)) {
                         return deny(format!("Address '{}' is blacklisted", dest));
                     }
                 }
@@ -1195,8 +1276,8 @@ fn evaluate_extension_call(
         };
         let allowed = |dest: &str| -> bool {
             match mode {
-                AddressMode::Whitelist => addresses.list.iter().any(|a| a == dest),
-                AddressMode::Blacklist => !addresses.list.iter().any(|a| a == dest),
+                AddressMode::Whitelist => addresses.list.iter().any(|a| same_address(a, dest)),
+                AddressMode::Blacklist => !addresses.list.iter().any(|a| same_address(a, dest)),
                 AddressMode::None => true,
             }
         };
@@ -1366,6 +1447,28 @@ fn address_mode(addresses: &Addresses) -> Result<AddressMode, Decision> {
              support if it was not written there"
         ))),
     }
+}
+
+/// Whether a listed address and a destination are the same address.
+///
+/// Exact, with one exception: an EVM address — `0x` and forty hex digits — is the
+/// same twenty bytes in any letter case (the mixed case of EIP-55 is a checksum,
+/// not part of the address). Compared exactly, a blacklist holding `0xabc…` let
+/// `0xABC…` through to the very account the owner had named.
+///
+/// Nothing else is folded. Base58 addresses (Solana, Bitcoin) and bech32 mean
+/// different things in different case; a NEAR account id is lower case only, so a
+/// differently-cased one is simply not that account, and refusing it is right.
+/// Both sides must have the EVM shape: a listed entry of another shape is never
+/// matched loosely.
+fn same_address(listed: &str, dest: &str) -> bool {
+    fn is_evm(s: &str) -> bool {
+        s.len() == 42 && s.starts_with("0x") && s.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+    }
+    if is_evm(listed) && is_evm(dest) {
+        return listed.eq_ignore_ascii_case(dest);
+    }
+    listed == dest
 }
 
 /// What a refusal has to add when the account it names is the OUTER destination
@@ -1700,6 +1803,34 @@ fn check_capabilities(
     approval: Option<&Approval>,
     op: &Op,
 ) -> Option<Decision> {
+    // A limit order paying out onto the confidential shard is ALSO a confidential
+    // operation, and answers to that capability first — by the same rules, its
+    // `requires_approval` included. A denial ends it here; an approval demand stands
+    // unless the order's own capability below denies.
+    let mut confidential_demand = None;
+    if let Op::LimitOrder { to_type, .. } = op {
+        let onto_the_confidential_shard = match to_type {
+            RecipientType::ConfidentialIntents => true,
+            RecipientType::Intents | RecipientType::DestinationChain => false,
+        };
+        if onto_the_confidential_shard {
+            let cap = caps.and_then(|c| c.confidential.as_ref());
+            if !cap.and_then(|c| c.allowed).unwrap_or(false) {
+                return Some(deny(
+                    "A limit order paying out to confidential_intents needs the 'confidential' \
+                     capability, which is not enabled by policy"
+                        .to_string(),
+                ));
+            }
+            if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
+                match approval_demand(approval, "confidential") {
+                    denied @ Decision::Deny { .. } => return Some(denied),
+                    demand => confidential_demand = Some(demand),
+                }
+            }
+        }
+    }
+
     let (cap, default_allowed) = match op {
         // raw signing is powerful and opaque: default-DENY unless explicitly enabled.
         Op::Raw { .. } => (caps.and_then(|c| c.raw_sign.as_ref()), false),
@@ -1715,6 +1846,9 @@ fn check_capabilities(
         // cross_chain_withdraw is Trusted AND the riskiest exit → default-DENY too, even when
         // transaction_types is absent (the type gate alone would fall through to Allow).
         Op::CrossChainWithdraw { .. } => (caps.and_then(|c| c.cross_chain_withdraw.as_ref()), false),
+        // A limit order pays out unattended, to an address of the caller's choosing →
+        // default-DENY on the same footing as the exit it can become.
+        Op::LimitOrder { .. } => (caps.and_then(|c| c.limit_order.as_ref()), false),
         _ => return None,
     };
 
@@ -1739,24 +1873,23 @@ fn check_capabilities(
     }
 
     if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
-        // The threshold comes from the approval block; absent → fail-closed (a
-        // capability that demands approval but has no approvers is a misconfiguration).
-        match approval.and_then(|a| a.threshold.as_ref()) {
-            Some(threshold) => {
-                return Some(Decision::RequiresApproval {
-                    threshold: threshold.required(),
-                })
-            }
-            None => {
-                return Some(deny(format!(
-                    "Capability '{}' requires approval but no approval threshold is configured",
-                    op.primary_type()
-                )))
-            }
-        }
+        return Some(approval_demand(approval, op.primary_type()));
     }
 
-    None
+    confidential_demand
+}
+
+/// What a capability's `requires_approval` turns into. The threshold comes from the
+/// approval block; absent → fail-closed (a capability that demands approval but has no
+/// approvers is a misconfiguration).
+fn approval_demand(approval: Option<&Approval>, capability: &str) -> Decision {
+    match approval.and_then(|a| a.threshold.as_ref()) {
+        Some(threshold) => Decision::RequiresApproval { threshold: threshold.required() },
+        None => deny(format!(
+            "Capability '{}' requires approval but no approval threshold is configured",
+            capability
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -2525,6 +2658,203 @@ mod tests {
         // Over the amount limit → Deny.
         let over = Op::PaymentCheck { amount: "50".into(), token: "nep141:usdt.tether-token.near".into() };
         assert!(matches!(evaluate(&policy, &over, None, 0), Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn a_limit_order_is_gated_as_the_exit_it_can_become() {
+        // The case this capability exists for: a SELL priced THROUGH the market fills at
+        // once, so "limit order" is not a gentler thing than a withdrawal — it is one,
+        // with a delay the owner does not control. It therefore carries a destination and
+        // is gated on it, not merely on being allowed to trade.
+        let op = Op::LimitOrder {
+            to: "0xRecipient".into(),
+            to_type: RecipientType::DestinationChain,
+            amount: "5".into(),
+            token: "nep141:usdt.tether-token.near".into(),
+            token_out: "nep141:wrap.near".into(),
+            min_amount_out: "1".into(),
+        };
+        assert_eq!(op.type_aliases(), &["limit_order"]);
+        assert_eq!(op.destination(), Some("0xRecipient"));
+        assert_eq!(op.amount(), Some("5"));
+        assert_eq!(op.token(), "nep141:usdt.tether-token.near");
+        // The deposit address exists only after the order does, so the op cannot be Built.
+        assert_eq!(bind_mode(&op), BindMode::Trusted);
+        assert!(op.triggers_generic_approval());
+
+        // Absent from the policy → denied, like every capability that moves funds out.
+        let no_cap: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["limit_order"],
+                "addresses":{"mode":"whitelist","list":["0xRecipient"]},
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&no_cap, &op, None, 0), Decision::Deny { .. }));
+
+        // Neither `swap` nor `cross_chain_withdraw` stands in for it: resting an order that
+        // pays out unattended is its own permission.
+        for other in ["swap", "cross_chain_withdraw"] {
+            let borrowed: Policy = serde_json::from_str(&format!(
+                r#"{{"rules":{{"transaction_types":["limit_order","{other}"],
+                    "addresses":{{"mode":"whitelist","list":["0xRecipient"]}},
+                    "limits":{{"per_transaction":{{"nep141:usdt.tether-token.near":"10"}}}}}},
+                    "capabilities":{{"{other}":{{"allowed":true}}}}}}"#
+            ))
+            .unwrap();
+            assert!(
+                matches!(evaluate(&borrowed, &op, None, 0), Decision::Deny { .. }),
+                "{other} must not stand in for limit_order",
+            );
+        }
+
+        // Opted in, whitelisted destination, within the amount limit → Allow.
+        let policy: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["limit_order"],
+                "addresses":{"mode":"whitelist","list":["0xRecipient"]},
+                "limits":{"per_transaction":{"nep141:usdt.tether-token.near":"10"}}},
+                "capabilities":{"limit_order":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&policy, &op, None, 0), Decision::Allow));
+
+        // The capability does NOT excuse the destination: an order paying somewhere the
+        // owner never listed is refused even when limit orders are permitted. This is the
+        // whole point — the price is the caller's, the payout address must be the owner's.
+        let elsewhere = Op::LimitOrder {
+            to: "0xSomeoneElse".into(),
+            to_type: RecipientType::DestinationChain,
+            amount: "5".into(),
+            token: "nep141:usdt.tether-token.near".into(),
+            token_out: "nep141:wrap.near".into(),
+            min_amount_out: "1".into(),
+        };
+        assert!(matches!(evaluate(&policy, &elsewhere, None, 0), Decision::Deny { .. }));
+
+        // Nor the amount limit.
+        let too_big = Op::LimitOrder {
+            to: "0xRecipient".into(),
+            to_type: RecipientType::DestinationChain,
+            amount: "50".into(),
+            token: "nep141:usdt.tether-token.near".into(),
+            token_out: "nep141:wrap.near".into(),
+            min_amount_out: "1".into(),
+        };
+        assert!(matches!(evaluate(&policy, &too_big, None, 0), Decision::Deny { .. }));
+
+        // A frozen wallet rests nothing new. (What it cannot do is unwind an order that is
+        // already resting — that is a cancel, not a policy decision.)
+        let frozen: Policy = serde_json::from_str(
+            r#"{"frozen":true,"rules":{"transaction_types":["limit_order"],
+                "addresses":{"mode":"whitelist","list":["0xRecipient"]}},
+                "capabilities":{"limit_order":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&frozen, &op, None, 0), Decision::Frozen));
+    }
+
+    #[test]
+    fn an_evm_address_is_the_same_address_in_any_letter_case() {
+        let lower = "0x52908400098527886e0f7030069857d2e4169ee7";
+        let eip55 = "0x52908400098527886E0F7030069857D2E4169EE7";
+        let op = |to: &str| Op::Withdraw { to: to.into(), amount: "1".into(), token: "t".into() };
+        let policy = |mode: &str, listed: &str| -> Policy {
+            serde_json::from_value(json!({"rules":{"addresses":{"mode":mode,"list":[listed]}}})).unwrap()
+        };
+
+        // The bypass this closes: a blacklisted address spelt in another case.
+        for (listed, sent) in [(lower, eip55), (eip55, lower), (lower, lower)] {
+            assert!(
+                matches!(evaluate(&policy("blacklist", listed), &op(sent), None, 0), Decision::Deny { .. }),
+                "blacklist {listed} let {sent} through",
+            );
+            assert!(matches!(evaluate(&policy("whitelist", listed), &op(sent), None, 0), Decision::Allow));
+        }
+
+        // Nothing else is folded.
+        assert!(same_address("bob.near", "bob.near"));
+        assert!(!same_address("bob.near", "Bob.near"));
+        // Base58 is case-sensitive: these are two different Solana accounts.
+        assert!(!same_address("7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV", "7ecdhsygxxyscszyep35khn8vvw3svaulktzxwcfltv"));
+        // Only the exact EVM shape, on BOTH sides: wrong length, no prefix, non-hex.
+        assert!(!same_address("0xABC", "0xabc"));
+        assert!(!same_address(&lower[2..], &eip55[2..]));
+        assert!(!same_address("0xZZ908400098527886e0f7030069857d2e4169ee7", "0xzz908400098527886e0f7030069857d2e4169ee7"));
+        // A different address stays different.
+        assert!(!same_address(lower, "0x52908400098527886e0f7030069857d2e4169ee8"));
+    }
+
+    #[test]
+    fn the_hash_an_approver_signs_is_pinned_to_a_vector_the_dashboard_shares() {
+        // The dashboard hashes the canonical string in the browser before an approver
+        // signs (`test/approval-hash.test.mjs` carries this same pair). If the canonical
+        // form or the hash ever changes, both sides must fail together, not one.
+        let op = Op::LimitOrder {
+            to: "me".into(),
+            to_type: RecipientType::Intents,
+            amount: "5".into(),
+            token: "nep141:wrap.near".into(),
+            token_out: "nep141:usdc.near".into(),
+            min_amount_out: "1".into(),
+        };
+        assert_eq!(
+            canonical_json(&op),
+            r#"{"amount":"5","kind":"limit_order","min_amount_out":"1","to":"me","to_type":"intents","token":"nep141:wrap.near","token_out":"nep141:usdc.near"}"#
+        );
+        assert_eq!(request_hash(&op), "78e16d304ba33901ea4a41eef1abd675e8a9d33ae0edb489e90158ffa9ad5491");
+    }
+
+    #[test]
+    fn a_limit_order_is_not_a_way_onto_the_confidential_shard() {
+        let op = |to_type: &str| Op::LimitOrder {
+            to: "me".into(),
+            to_type: serde_json::from_value(json!(to_type)).expect("a recipient type"),
+            amount: "5".into(),
+            token: "nep141:wrap.near".into(),
+            token_out: "nep141:usdc.near".into(),
+            min_amount_out: "1".into(),
+        };
+        let policy = |caps: &str| -> Policy {
+            serde_json::from_str(&format!(
+                r#"{{"rules":{{"transaction_types":["limit_order"]}},"capabilities":{caps}}}"#
+            ))
+            .unwrap()
+        };
+
+        // Limit orders permitted, confidential never mentioned: the plain intents
+        // balance is fine, the confidential shard is not.
+        let orders_only = policy(r#"{"limit_order":{"allowed":true}}"#);
+        assert!(matches!(evaluate(&orders_only, &op("intents"), None, 0), Decision::Allow));
+        assert!(matches!(evaluate(&orders_only, &op("destination_chain"), None, 0), Decision::Allow));
+        assert!(matches!(evaluate(&orders_only, &op("confidential_intents"), None, 0), Decision::Deny { .. }));
+
+        // Both permitted → allowed.
+        let both = policy(r#"{"limit_order":{"allowed":true},"confidential":{"allowed":true}}"#);
+        assert!(matches!(evaluate(&both, &op("confidential_intents"), None, 0), Decision::Allow));
+
+        // `confidential` alone does not stand in for `limit_order`.
+        let conf_only = policy(r#"{"confidential":{"allowed":true}}"#);
+        assert!(matches!(evaluate(&conf_only, &op("confidential_intents"), None, 0), Decision::Deny { .. }));
+
+        // The confidential capability's own approval demand applies to the order — seen
+        // here fail-closed, on a policy with no approvers to ask — and only to an order
+        // that goes there.
+        let conf_approval = policy(
+            r#"{"limit_order":{"allowed":true},"confidential":{"allowed":true,"requires_approval":true}}"#,
+        );
+        assert!(matches!(evaluate(&conf_approval, &op("confidential_intents"), None, 0), Decision::Deny { .. }));
+        assert!(matches!(evaluate(&conf_approval, &op("intents"), None, 0), Decision::Allow));
+
+        // No other spelling of it exists: a value that is not one of the three does not
+        // parse, so an op carrying it never reaches the engine at all.
+        for bad in ["CONFIDENTIAL_INTENTS", "confidential-intents", "Intents", "", "origin_chain"] {
+            let raw = json!({"kind":"limit_order","to":"me","to_type":bad,"amount":"5",
+                "token":"a","token_out":"b","min_amount_out":"1"});
+            assert!(serde_json::from_value::<Op>(raw).is_err(), "{bad:?} parsed as a recipient type");
+        }
+        assert!(canonical_json(&op("confidential_intents")).contains(r#""to_type":"confidential_intents""#));
+
+        // The terms approvers sign say which kind of place `to` is.
+        assert_ne!(canonical_json(&op("intents")), canonical_json(&op("destination_chain")));
     }
 
     #[test]
