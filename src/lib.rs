@@ -72,12 +72,21 @@ impl AllowedKeyTypes {
 /// are EVM. Accepts canonical long names and 1Click-style short aliases; all of
 /// these resolve to ONE derived secp256k1 address. `hyperevm` is Hyperliquid's
 /// EVM (chain id 999) — the custody wallet signs there like on any other EVM
-/// network; it is not a 1Click withdraw chain.
+/// network; it is not a 1Click withdraw chain. `hood` is Robinhood Chain, an
+/// Arbitrum L2; `hood` is the word 1Click's catalog uses for it, and the only
+/// one we accept — there is no long form to alias.
+///
+/// **A new chain gets one name, and an alias needs a reason.** Every alias here
+/// is a spelling something upstream actually emits — 1Click's `blockchain`
+/// field, or the long name of a chain whose 1Click id is an abbreviation. A
+/// synonym nobody emits is a string to keep in sync in two services and five
+/// repositories, typed nowhere, for a request no client makes.
 pub fn is_evm_chain(chain: &str) -> bool {
     matches!(
         chain,
         "ethereum" | "eth" | "polygon" | "pol" | "matic" | "base" | "arbitrum" | "arb"
             | "optimism" | "op" | "bsc" | "avalanche" | "avax" | "hyperevm"
+            | "hood"
     )
 }
 
@@ -441,11 +450,11 @@ mod tests {
     fn test_is_evm_chain() {
         for c in [
             "ethereum", "eth", "polygon", "pol", "matic", "base", "arbitrum", "arb", "optimism",
-            "op", "bsc", "avalanche", "avax", "hyperevm",
+            "op", "bsc", "avalanche", "avax", "hyperevm", "hood",
         ] {
             assert!(is_evm_chain(c), "{c} should be EVM");
         }
-        for c in ["near", "solana", "sol", "bitcoin", "btc", ""] {
+        for c in ["near", "solana", "sol", "bitcoin", "btc", "robinhood", ""] {
             assert!(!is_evm_chain(c), "{c} must not be EVM");
         }
     }
