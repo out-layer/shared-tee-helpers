@@ -233,7 +233,7 @@ pub async fn check_access_key_on_contract(
         .json(&body)
         .send()
         .await
-        .map_err(|e| TeeAuthError::NearRpcError(format!("request failed: {}", e)))?;
+        .map_err(|e| TeeAuthError::NearRpcError(format!("request failed: {}", e.without_url())))?;
 
     let json: serde_json::Value = response
         .json()
