@@ -15,8 +15,10 @@ use std::str::FromStr;
 
 pub mod access_limits;
 pub mod binding;
+pub mod contract_vote;
 pub mod hos;
 pub mod secrets_ref;
+pub mod signer_key;
 /// NEAR's shape for an account id, for every door that takes one — not only
 /// a `secrets_ref`.
 pub use secrets_ref::account_id_is_well_formed;
