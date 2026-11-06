@@ -517,19 +517,17 @@ impl Op {
         }
     }
 
-    /// Whether this op participates in the generic approval-threshold trigger — the fund-moving
-    /// kinds with a WIRED approved-execution path: Built (transfer/call/delete/withdraw) AND the
-    /// Trusted kinds swap/confidential/cross_chain_withdraw. For Built/HashPinned the approver
-    /// signature binds to exactly what executes (constructed from the op / pinned by hash). For
-    /// Trusted the approval is OWNER CONTROL: it gates WHETHER the op runs and binds its
-    /// policy-checked token+amount; the coordinator supplies the off-chain artifact (e.g. the
-    /// 1Click deposit address) at execution and that destination is coordinator-trusted — a
-    /// documented tradeoff (we do not defend against a compromised coordinator, the access path).
-    /// EXCLUDED: `payment_check` is Trusted + fund-moving but is NOT wired for approved-execution,
-    /// so its creation is gated by its default-DENY capability + per-transaction amount cap
-    /// instead (cap-gated, not approval-gated, even on a multisig wallet — wiring it is a future
-    /// follow-up). `raw`/`sign_message`/`auth` are non-fund or domain-separated and governed by
-    /// their own capability rules.
+    /// Whether this op participates in the generic approval-threshold trigger: every
+    /// fund-moving kind — Built (transfer/call/delete/withdraw/intents_transfer) AND the
+    /// Trusted kinds swap/confidential/cross_chain_withdraw/limit_order/payment_check. For
+    /// Built/HashPinned the approver signature binds to exactly what executes (constructed
+    /// from the op / pinned by hash). For Trusted the approval is OWNER CONTROL: it gates
+    /// WHETHER the op runs and binds its policy-checked token+amount; the coordinator
+    /// supplies the off-chain artifact (e.g. the 1Click deposit address, a check's ephemeral
+    /// account) at execution and that destination is coordinator-trusted — a documented
+    /// tradeoff (we do not defend against a compromised coordinator, the access path).
+    /// `raw`/`sign_message`/`auth` are non-fund or domain-separated and governed by their
+    /// own capability rules.
     fn triggers_generic_approval(&self) -> bool {
         matches!(
             self,
@@ -542,6 +540,7 @@ impl Op {
                 | Op::Confidential { .. }
                 | Op::CrossChainWithdraw { .. }
                 | Op::LimitOrder { .. }
+                | Op::PaymentCheck { .. }
         )
     }
 }
@@ -2552,6 +2551,7 @@ mod tests {
             Op::Swap { token_in: "a".into(), amount_in: "1".into(), token_out: "b".into(), min_out: "1".into() },
             Op::Confidential { flow: "withdraw".into(), to: Some("x".into()), amount: "1".into(), token: "near".into(), chain: Some("near".into()), token_out: None, min_amount_out: None },
             Op::CrossChainWithdraw { to: "0x".into(), amount: "1".into(), token: "nep141:usdt.tether-token.near".into(), chain: "ethereum".into() },
+            Op::PaymentCheck { amount: "1".into(), token: "nep141:usdt.tether-token.near".into() },
         ];
         for op in &ops {
             assert!(op.triggers_generic_approval(), "Trusted must trigger generic approval: {:?}", op);
@@ -2566,11 +2566,6 @@ mod tests {
         for op in &ops {
             assert!(matches!(evaluate(&no_threshold, op, None, 0), Decision::Allow), "Trusted op without threshold should allow: {:?}", op);
         }
-        // payment_check is Trusted + fund-moving but NOT wired for approved-execution → excluded
-        // from the threshold; gated by its capability + per-tx cap (cap-gated, not approval-gated).
-        let pc = Op::PaymentCheck { amount: "1".into(), token: "nep141:usdt.tether-token.near".into() };
-        assert!(!pc.triggers_generic_approval());
-        assert!(matches!(evaluate(&policy, &pc, None, 0), Decision::Allow));
         // Built fund-movers also trigger the threshold.
         assert!(Op::Transfer { to: "a".into(), amount: "1".into() }.triggers_generic_approval());
         assert!(Op::Withdraw { to: "a".into(), amount: "1".into(), token: "near".into() }.triggers_generic_approval());
@@ -2635,9 +2630,9 @@ mod tests {
         assert_eq!(op.amount(), Some("5"));
         assert_eq!(op.token(), "nep141:usdt.tether-token.near");
         assert_eq!(bind_mode(&op), BindMode::Trusted);
-        // Trusted + fund-moving, but NOT wired for approved-execution → excluded from the generic
-        // threshold; gated by its default-DENY capability + per-transaction amount cap.
-        assert!(!op.triggers_generic_approval());
+        // Trusted and fund-moving: it faces the generic threshold like every other kind that
+        // moves money, and its default-DENY capability + per-transaction amount cap besides.
+        assert!(op.triggers_generic_approval());
 
         // Capability absent → default-DENY even if the type is allowed.
         let no_cap: Policy = serde_json::from_str(
@@ -3975,46 +3970,90 @@ mod tests {
     /// A capability that demands approval yields a threshold, and fails closed
     /// when there is nobody to give it.
     ///
-    /// Measured on `payment_check` and `raw_sign` — the two capability kinds the
-    /// GENERIC trigger never touches. On a kind that also triggers generically
-    /// (swap, confidential) both paths return the same threshold, so a test
-    /// written there cannot tell a working capability flag from an ignored one.
+    /// Measured on `raw_sign` — a capability kind the GENERIC trigger never
+    /// touches. On a kind that also triggers generically (swap, confidential,
+    /// payment_check) both paths return the same threshold, so a test written
+    /// there cannot tell a working capability flag from an ignored one.
     #[test]
     fn a_capability_requiring_approval_yields_a_threshold_and_fails_closed_without_one() {
-        let check = || Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+        let raw_op = || Op::Raw { chain: "ethereum".into(), payload_hash: "00".repeat(32), label: None };
 
         let wired = policy_from(json!({
             "approval": { "threshold": { "required": 3 } },
-            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+            "capabilities": { "raw_sign": { "allowed": true, "requires_approval": true } }
         }));
-        assert_eq!(evaluate(&wired, &check(), None, 0), Decision::RequiresApproval { threshold: 3 });
+        assert_eq!(evaluate(&wired, &raw_op(), None, 0), Decision::RequiresApproval { threshold: 3 });
 
         // A capability behind an approval nobody can give is a misconfiguration,
         // and the only safe reading of it is "no". Allowing it would turn a
         // half-finished policy into a fully-open one.
         let unwired = policy_from(json!({
-            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+            "capabilities": { "raw_sign": { "allowed": true, "requires_approval": true } }
         }));
-        match evaluate(&unwired, &check(), None, 0) {
+        match evaluate(&unwired, &raw_op(), None, 0) {
             Decision::Deny { reason } => assert!(reason.contains("approval"), "{reason}"),
             d => panic!("a capability demanding an absent approval must deny, got {d:?}"),
         }
 
         // Without the flag the same capability simply allows, so the two cases
-        // above are about `requires_approval` and not about `payment_check`.
+        // above are about `requires_approval` and not about `raw_sign`.
+        let plain = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true } } }));
+        assert_eq!(evaluate(&plain, &raw_op(), None, 0), Decision::Allow);
+
+        // The same misconfiguration fails closed on a kind the generic trigger
+        // DOES cover: without a threshold the generic trigger is inert, so the
+        // capability's own demand is the only thing left, and it denies.
+        let check = Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+        let check_unwired = policy_from(json!({
+            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+        }));
+        match evaluate(&check_unwired, &check, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("approval"), "{reason}"),
+            d => panic!("a capability demanding an absent approval must deny, got {d:?}"),
+        }
+    }
+
+    /// A payment check faces the approval threshold like every operation that
+    /// moves money: the generic trigger, `excluded_types`, and the capability's
+    /// own `requires_approval` all read on it, in the order the engine decides.
+    #[test]
+    fn a_payment_check_is_held_to_the_approval_threshold() {
+        let check = || Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+
+        // The threshold set and the capability allowed: approval is required.
+        let gated = policy_from(json!({
+            "approval": { "threshold": 2 },
+            "capabilities": { "payment_check": { "allowed": true } }
+        }));
+        assert_eq!(evaluate(&gated, &check(), None, 0), Decision::RequiresApproval { threshold: 2 });
+
+        // The owner excluded the type: the threshold does not apply, the
+        // capability still does.
+        let excluded = policy_from(json!({
+            "approval": { "threshold": 2, "excluded_types": ["payment_check"] },
+            "capabilities": { "payment_check": { "allowed": true } }
+        }));
+        assert_eq!(evaluate(&excluded, &check(), None, 0), Decision::Allow);
+
+        // No threshold: the capability alone decides.
         let plain = policy_from(json!({ "capabilities": { "payment_check": { "allowed": true } } }));
         assert_eq!(evaluate(&plain, &check(), None, 0), Decision::Allow);
 
-        // The middle state exists for every capability that has one, not just
-        // the first one somebody tested.
-        let raw = policy_from(json!({
-            "approval": { "threshold": 2 },
-            "capabilities": { "raw_sign": { "allowed": true, "requires_approval": true } }
+        // The capability is checked BEFORE the threshold: a wallet that never
+        // enabled payment checks is denied, not asked to collect votes.
+        let denied = policy_from(json!({ "approval": { "threshold": 2 } }));
+        match evaluate(&denied, &check(), None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("payment_check"), "{reason}"),
+            d => panic!("a capability that is not enabled must deny before the threshold, got {d:?}"),
+        }
+
+        // The capability's own `requires_approval` demands the same threshold,
+        // and `excluded_types` cannot take that demand away.
+        let demanded = policy_from(json!({
+            "approval": { "threshold": 2, "excluded_types": ["payment_check"] },
+            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
         }));
-        let raw_op = Op::Raw { chain: "ethereum".into(), payload_hash: "00".repeat(32), label: None };
-        assert_eq!(evaluate(&raw, &raw_op, None, 0), Decision::RequiresApproval { threshold: 2 });
-        let raw_plain = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true } } }));
-        assert_eq!(evaluate(&raw_plain, &raw_op, None, 0), Decision::Allow);
+        assert_eq!(evaluate(&demanded, &check(), None, 0), Decision::RequiresApproval { threshold: 2 });
     }
 
     /// `excluded_types` cannot switch off a capability's own approval.
@@ -4025,16 +4064,16 @@ mod tests {
     /// must not discover they also disarmed the approval they deliberately put
     /// on the capability.
     ///
-    /// `payment_check` names the property without ambiguity: it is outside the
+    /// `raw_sign` names the property without ambiguity: it is outside the
     /// generic trigger, so the only thing that can produce an approval here is
     /// the capability, and the only thing `excluded_types` could do is remove it.
     #[test]
     fn excluded_types_cannot_switch_off_a_capability_that_demands_approval() {
         let p = policy_from(json!({
-            "approval": { "threshold": 2, "excluded_types": ["payment_check"] },
-            "capabilities": { "payment_check": { "allowed": true, "requires_approval": true } }
+            "approval": { "threshold": 2, "excluded_types": ["raw", "raw_sign"] },
+            "capabilities": { "raw_sign": { "allowed": true, "requires_approval": true } }
         }));
-        let op = Op::PaymentCheck { amount: "1".into(), token: "usdc.near".into() };
+        let op = Op::Raw { chain: "ethereum".into(), payload_hash: "00".repeat(32), label: None };
         assert_eq!(evaluate(&p, &op, None, 0), Decision::RequiresApproval { threshold: 2 });
 
         // The same policy on a kind that IS generically triggered: the
