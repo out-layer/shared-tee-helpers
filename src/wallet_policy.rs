@@ -223,9 +223,13 @@ pub enum Op {
     /// OutLayer coordinator authentication (Bearer-near / register / api-key). The
     /// keystore CONSTRUCTS a domain-separated `<prefix>:<seed>:<ts>[:<vault>]` string
     /// with a fresh timestamp and signs it RAW ed25519 (NOT NEP-413). It is non-fund
-    /// (never a 32-byte tx hash), so it is always allowed — no capability or multisig.
-    /// `purpose` selects the prefix: `bearer`→`auth`, `register`→`register`,
-    /// `api-key`→`api-key`. `vault_id` is only valid for `bearer`.
+    /// (never a 32-byte tx hash), so it is always allowed — no capability or multisig —
+    /// on a wallet that is not frozen. `purpose` selects the prefix: `bearer`→`auth`,
+    /// `register`→`register`, `api-key`→`api-key`. `vault_id` is only valid for `bearer`.
+    ///
+    /// `purpose: "jwt"` is the confidential shard's session proof: a NEP-413 signature
+    /// over a challenge the keystore builds with an EMPTY `intents` array. It alone
+    /// passes a freeze ([`survives_a_freeze`]).
     Auth {
         purpose: String,
         seed: String,
@@ -909,6 +913,19 @@ pub fn evaluate(policy: &Policy, op: &Op, usage: Option<&Usage>, now_unix: u64) 
     wallet
 }
 
+/// The one op a frozen wallet may still sign: the confidential shard's session proof.
+///
+/// A freeze leaves resting orders resting, and cancelling is how the wallet gets its
+/// money back out of them, so cancelling must keep working under a freeze. An order on
+/// the confidential shard is cancelled under the wallet's per-account JWT, which lasts
+/// fifteen minutes and is minted from this proof. The proof moves nothing: the keystore
+/// builds its challenge with an empty `intents` array and it is not reachable by a
+/// caller of the wallet API, and every fund-moving op a JWT could lead to still needs a
+/// signature that the freeze refuses.
+fn survives_a_freeze(op: &Op) -> bool {
+    matches!(op, Op::Auth { purpose, .. } if purpose == "jwt")
+}
+
 /// Evaluate one rule set in isolation.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_section(
@@ -920,11 +937,11 @@ fn evaluate_section(
     usage: Option<&Usage>,
     now_unix: u64,
 ) -> Decision {
-    // 1. Frozen wallet — reject EVERYTHING, including auth. A freeze fully halts the
-    //    wallet; the controller's intent is a hard stop, so even identity proofs are
-    //    refused until it is unfrozen.
+    // 1. Frozen wallet — reject everything, identity proofs included, until it is
+    //    unfrozen: the controller's intent is a hard stop. The one exception is what
+    //    cancelling a resting confidential order runs on ([`survives_a_freeze`]).
     if frozen {
-        return Decision::Frozen;
+        return if survives_a_freeze(op) { Decision::Allow } else { Decision::Frozen };
     }
 
     // 2. Auth ops are non-fund identity proofs (raw ed25519 over a domain-separated
@@ -3382,6 +3399,42 @@ mod tests {
         // But a freeze halts everything, including auth.
         let frozen = policy_from(json!({ "frozen": true }));
         assert_eq!(evaluate(&frozen, &op, None, 0), Decision::Frozen);
+    }
+
+    /// A frozen wallet can still cancel a resting confidential order, and that takes the
+    /// confidential session proof. Nothing else gets through with it: not the other auth
+    /// purposes, which are what a caller of the wallet API can ask for, and not the ops a
+    /// session would lead to.
+    #[test]
+    fn a_freeze_passes_the_confidential_session_proof_and_nothing_else() {
+        let frozen = policy_from(json!({ "frozen": true }));
+        let auth = |purpose: &str| Op::Auth { purpose: purpose.into(), seed: "s".into(), vault_id: None };
+        assert_eq!(evaluate(&frozen, &auth("jwt"), None, 0), Decision::Allow);
+        for purpose in ["bearer", "register", "api-key", "JWT", "jwt ", ""] {
+            assert_eq!(evaluate(&frozen, &auth(purpose), None, 0), Decision::Frozen, "{purpose:?}");
+        }
+        let fund_moving = [
+            Op::Confidential {
+                flow: "unshield".into(),
+                token: "nep141:wrap.near".into(),
+                amount: "1".into(),
+                to: None,
+                chain: None,
+                token_out: None,
+                min_amount_out: None,
+            },
+            Op::LimitOrder {
+                to: "me".into(),
+                to_type: RecipientType::ConfidentialIntents,
+                amount: "1".into(),
+                token: "nep141:wrap.near".into(),
+                token_out: "nep141:usdc.near".into(),
+                min_amount_out: "1".into(),
+            },
+        ];
+        for op in fund_moving {
+            assert_eq!(evaluate(&frozen, &op, None, 0), Decision::Frozen, "{op:?}");
+        }
     }
 
     #[test]
