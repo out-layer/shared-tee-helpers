@@ -236,6 +236,137 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vault_id: Option<String>,
     },
+
+    /// A new policy for a wallet whose current policy is locked (`approval.locked`).
+    /// What the current policy's approvers vote on: the wallet, the sha256 of the
+    /// NEW policy's canonical plaintext ([`policy_canonical_hash`]), the version
+    /// the contract will store it under (the current one plus one), the new
+    /// policy's own `locked` flag, and the NEAR account that will send
+    /// `store_wallet_policy`. The keystore recomputes every field from the blob
+    /// and the chain, so approvers approve exactly what lands in the contract.
+    ///
+    /// Not an artifact: nothing is signed FROM it. The keystore's `sign-policy`
+    /// verifies the votes over its `request_hash` and then signs the contract's
+    /// own `store_wallet_policy:v2:…` message; `wallet/sign` refuses it outright.
+    PolicyUpdate {
+        wallet_pubkey: String,
+        policy_hash: String,
+        version: u64,
+        locked: bool,
+        caller: String,
+    },
+}
+
+/// `sha256` of a policy's canonical JSON — every object's keys sorted, compact
+/// encoding — as the approvers of a locked policy sign it inside
+/// [`Op::PolicyUpdate`].
+///
+/// Taken from a `serde_json::Value`, not from bytes: the keystore parses the
+/// plaintext it decrypted, the coordinator receives the keystore's
+/// re-serialisation of that same parse, and `serde_json`'s serialisation of a
+/// `Value` is idempotent, so both sides hash the same thing. The whole document
+/// counts — `version`, `frozen`, `null` fields, everything `encrypt-policy` put
+/// in the blob — never a client's copy of it.
+pub fn policy_canonical_hash(policy: &serde_json::Value) -> [u8; 32] {
+    let canonical = canonicalize_value(policy);
+    let text = serde_json::to_string(&canonical).expect("Value serialization is infallible");
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.finalize().into()
+}
+
+/// [`policy_canonical_hash`] as lowercase hex — the form `Op::PolicyUpdate`
+/// carries.
+pub fn policy_canonical_hash_hex(policy: &serde_json::Value) -> String {
+    hex::encode(policy_canonical_hash(policy))
+}
+
+/// Whether raw signing on the NEAR key is open: `raw_sign.allowed` with no
+/// `chains` list, or one that names `near`.
+///
+/// The NEAR raw key IS the wallet's transaction key, and a raw signature over
+/// 32 caller-chosen bytes is a signature over any transaction hash — and over
+/// the hash of the contract's own `store_wallet_policy` message. A policy that
+/// is locked and leaves this open is not locked.
+fn raw_signing_on_near_is_open(policy: &Policy) -> bool {
+    let Some(cap) = policy.capabilities.as_ref().and_then(|c| c.raw_sign.as_ref()) else {
+        return false;
+    };
+    if !cap.allowed.unwrap_or(false) {
+        return false;
+    }
+    match cap.chains.as_ref() {
+        None => true,
+        Some(chains) => chains.iter().any(|c| c.eq_ignore_ascii_case("near")),
+    }
+}
+
+/// Whether a policy that asks to be locked can ever be unlocked, and holds.
+///
+/// `approval.locked: true` makes every later policy write wait for the
+/// approvers' quorum, so the quorum has to be reachable: a threshold of at
+/// least one, at least that many DISTINCT approvers with an `id` (the votes
+/// are counted per account, so a repeated entry is one voter). And it has to
+/// hold: raw signing on the NEAR key would sign the contract's message
+/// without any vote ([`raw_signing_on_near_is_open`]), so a locked policy may
+/// not leave it open. A policy that is not locked passes whatever its approval
+/// block says. Checked wherever a policy is written — the coordinator's
+/// `encrypt-policy` and the keystore's `sign-policy` — so a lock that nobody
+/// could lift, or anybody could step around, is never stored.
+pub fn lock_is_satisfiable(policy: &Policy) -> Result<(), String> {
+    let Some(approval) = policy.approval.as_ref() else {
+        return Ok(());
+    };
+    if !approval.locked.unwrap_or(false) {
+        return Ok(());
+    }
+    if raw_signing_on_near_is_open(policy) {
+        return Err(
+            "approval.locked cannot hold with raw signing open on near: a raw signature by the \
+             NEAR key is a signature over the contract's policy message, so the lock would be \
+             stepped around without a vote. Disable capabilities.raw_sign or list its chains \
+             without near"
+                .to_string(),
+        );
+    }
+    let threshold = approval
+        .threshold
+        .as_ref()
+        .ok_or_else(|| {
+            "approval.locked needs approval.threshold: a locked policy is changed only with its \
+             approvers' quorum, and there is no quorum without a threshold"
+                .to_string()
+        })?
+        .required();
+    if threshold < 1 {
+        return Err(format!(
+            "approval.locked needs approval.threshold of at least 1, got {threshold}"
+        ));
+    }
+    let named = approval
+        .approvers
+        .as_ref()
+        .map(|v| {
+            v.iter()
+                .filter_map(|a| a.id.as_deref().map(str::trim).filter(|id| !id.is_empty()))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
+    if named == 0 {
+        return Err(
+            "approval.locked needs approval.approvers with an id each: a locked policy is changed \
+             only with their quorum, and nobody could lift this one"
+                .to_string(),
+        );
+    }
+    if (threshold as usize) > named {
+        return Err(format!(
+            "approval.locked needs a reachable quorum: threshold {threshold} but only {named} \
+             distinct approver(s) with an id — this lock could never be lifted"
+        ));
+    }
+    Ok(())
 }
 
 /// Build the exact byte string the OutLayer coordinator's `verify_near_auth_fields`
@@ -362,6 +493,9 @@ pub enum BindMode {
     /// Artifact cannot exist at approval time; keystore checks capability + policy +
     /// multisig on op fields, then signs the supplied artifact, trusting the generator.
     Trusted,
+    /// No artifact at all: the op is what a locked policy's approvers vote on, and
+    /// the keystore's `sign-policy` — never `wallet/sign` — acts on the votes.
+    PolicyUpdate,
 }
 
 /// The bind mode for an op. Total function over all kinds.
@@ -380,6 +514,7 @@ pub fn bind_mode(op: &Op) -> BindMode {
         | Op::PaymentCheck { .. } => BindMode::Trusted,
         // Auth is constructed-from-op (fresh-ts auth string), like the Built kinds.
         Op::Auth { .. } => BindMode::Built,
+        Op::PolicyUpdate { .. } => BindMode::PolicyUpdate,
     }
 }
 
@@ -457,6 +592,7 @@ impl Op {
             Op::Raw { .. } => &["raw"],
             Op::SignMessage { .. } => &["sign_message"],
             Op::Auth { .. } => &["auth"],
+            Op::PolicyUpdate { .. } => &["policy_update"],
         }
     }
 
@@ -478,7 +614,9 @@ impl Op {
             | Op::LimitOrder { token, .. }
             | Op::PaymentCheck { token, .. } => token,
             Op::Swap { token_in, .. } => token_in,
-            Op::Raw { .. } | Op::SignMessage { .. } | Op::Auth { .. } => "native",
+            Op::Raw { .. } | Op::SignMessage { .. } | Op::Auth { .. } | Op::PolicyUpdate { .. } => {
+                "native"
+            }
         }
     }
 
@@ -495,7 +633,11 @@ impl Op {
             | Op::PaymentCheck { amount, .. } => Some(amount),
             Op::Call { deposit, .. } => Some(deposit),
             Op::Swap { amount_in, .. } => Some(amount_in),
-            Op::Delete { .. } | Op::Raw { .. } | Op::SignMessage { .. } | Op::Auth { .. } => None,
+            Op::Delete { .. }
+            | Op::Raw { .. }
+            | Op::SignMessage { .. }
+            | Op::Auth { .. }
+            | Op::PolicyUpdate { .. } => None,
         }
     }
 
@@ -517,7 +659,8 @@ impl Op {
             | Op::Raw { .. }
             | Op::SignMessage { .. }
             | Op::Auth { .. }
-            | Op::PaymentCheck { .. } => None,
+            | Op::PaymentCheck { .. }
+            | Op::PolicyUpdate { .. } => None,
         }
     }
 
@@ -531,7 +674,8 @@ impl Op {
     /// account) at execution and that destination is coordinator-trusted — a documented
     /// tradeoff (we do not defend against a compromised coordinator, the access path).
     /// `raw`/`sign_message`/`auth` are non-fund or domain-separated and governed by their
-    /// own capability rules.
+    /// own capability rules. `policy_update` is what a locked policy's approvers vote on
+    /// and is never evaluated here: the lock is its own check in `sign-policy`.
     fn triggers_generic_approval(&self) -> bool {
         matches!(
             self,
@@ -652,6 +796,13 @@ pub struct Approval {
     pub threshold: Option<Threshold>,
     #[serde(default)]
     pub approvers: Option<Vec<Approver>>,
+    /// The policy is changed only with these approvers' quorum: every later
+    /// `store_wallet_policy` — including one that clears this flag — and every
+    /// delete waits for `threshold` votes over [`Op::PolicyUpdate`]. The owner
+    /// alone can set it (a tightening) and cannot clear it. Freezing is not a
+    /// policy write and stays the owner's. See [`lock_is_satisfiable`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
     /// Op types exempt from the approval trigger (e.g. quote-driven flows that
     /// expire too fast to wait for multisig).
     #[serde(default)]
@@ -937,6 +1088,33 @@ fn evaluate_section(
     usage: Option<&Usage>,
     now_unix: u64,
 ) -> Decision {
+    // 0. A policy update is not something a wallet signs; its approvers vote on it
+    //    and `sign-policy` checks the votes against the lock. Refused before any
+    //    rule is read, so no rule — not `transaction_types`, not `excluded_types`
+    //    — can let it through this path.
+    if matches!(op, Op::PolicyUpdate { .. }) {
+        return deny(
+            "policy_update is not signed by wallet/sign: a locked policy is changed through \
+             sign-policy with the approvers' votes"
+                .to_string(),
+        );
+    }
+    // 0a. Under a lock, no raw signature by the NEAR key: it is the key the
+    //     contract's policy message is verified with, and 32 raw bytes are any
+    //     hash. A locked policy never has this open (`lock_is_satisfiable`);
+    //     refused here as well so a stored one cannot be stepped around.
+    if approval.and_then(|a| a.locked).unwrap_or(false) {
+        if let Op::Raw { chain, .. } = op {
+            if chain.eq_ignore_ascii_case("near") {
+                return deny(
+                    "raw signing on near is refused while the policy is locked: a raw signature \
+                     by the NEAR key could stand in for the policy signature the lock protects"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     // 1. Frozen wallet — reject everything, identity proofs included, until it is
     //    unfrozen: the controller's intent is a hard stop. The one exception is what
     //    cancelling a resting confidential order runs on ([`survives_a_freeze`]).
@@ -2472,6 +2650,7 @@ mod tests {
 
     #[test]
     fn bind_modes_cover_all_kinds() {
+        assert_eq!(bind_mode(&policy_update_op()), BindMode::PolicyUpdate);
         assert_eq!(
             bind_mode(&Op::Transfer { to: "a.near".into(), amount: "1".into() }),
             BindMode::Built
@@ -2948,6 +3127,153 @@ mod tests {
         // hash reproduces from a JSON round-trip (different field order on the wire).
         let reparsed: Op = serde_json::from_str(r#"{"to":"a.near","amount":"1000","kind":"transfer"}"#).unwrap();
         assert_eq!(request_hash(&op), request_hash(&reparsed));
+    }
+
+    // ----- policy lock: Op::PolicyUpdate, policy_canonical_hash, lock_is_satisfiable -----
+
+    fn policy_update_op() -> Op {
+        Op::PolicyUpdate {
+            wallet_pubkey: format!("ed25519:{}", "ab".repeat(32)),
+            policy_hash: "cd".repeat(32),
+            version: 3,
+            locked: true,
+            caller: "alice.near".into(),
+        }
+    }
+
+    /// The hash the approvers sign is a fixture: a change here breaks every
+    /// vote already cast on a pending policy update.
+    #[test]
+    fn a_policy_update_hashes_to_its_fixture() {
+        let op = policy_update_op();
+        assert_eq!(
+            canonical_json(&op),
+            r#"{"caller":"alice.near","kind":"policy_update","locked":true,"policy_hash":"PH","version":3,"wallet_pubkey":"ed25519:WP"}"#
+                .replace("PH", &"cd".repeat(32))
+                .replace("WP", &"ab".repeat(32))
+        );
+        assert_eq!(request_hash(&op), "4105c17077e67e1408f31573d60d65ca0b93c0f512e11aef4992ed900f4ba249");
+        let reparsed: Op = serde_json::from_str(&canonical_json(&op)).unwrap();
+        assert_eq!(reparsed, op);
+    }
+
+    #[test]
+    fn a_policy_update_is_its_own_kind_and_never_a_fund_op() {
+        let op = policy_update_op();
+        assert_eq!(bind_mode(&op), BindMode::PolicyUpdate);
+        assert_eq!(op.type_aliases(), &["policy_update"]);
+        assert!(!op.triggers_generic_approval());
+        assert_eq!(op.amount(), None);
+        assert_eq!(op.destination(), None);
+    }
+
+    /// No rule lets a policy update through `evaluate`: not a `transaction_types`
+    /// that names it, not an `excluded_types`, not a threshold — and a frozen
+    /// wallet answers Deny, not Frozen, because the refusal comes first.
+    #[test]
+    fn a_policy_update_is_refused_by_evaluate_whatever_the_policy_says() {
+        let op = policy_update_op();
+        let open = Policy::default();
+        let naming_it = policy_from(json!({ "rules": { "transaction_types": ["policy_update"] } }));
+        let excluding_it = policy_from(json!({
+            "approval": { "threshold": 2, "approvers": [{"id": "a"}], "excluded_types": ["policy_update"] }
+        }));
+        let frozen = policy_from(json!({ "frozen": true }));
+        for (name, policy) in [("open", &open), ("naming", &naming_it), ("excluding", &excluding_it), ("frozen", &frozen)] {
+            match evaluate(policy, &op, None, 0) {
+                Decision::Deny { reason } => assert!(reason.contains("sign-policy"), "{name}: {reason}"),
+                d => panic!("{name}: expected Deny, got {d:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn approval_locked_parses_and_defaults_to_none() {
+        let p = policy_from(json!({ "approval": { "threshold": 2, "approvers": [{"id": "a"}], "locked": true } }));
+        assert_eq!(p.approval.as_ref().unwrap().locked, Some(true));
+        let p = policy_from(json!({ "approval": { "threshold": 2 } }));
+        assert_eq!(p.approval.as_ref().unwrap().locked, None);
+        // Absent stays absent on the wire: a policy that never set it is not rewritten with it.
+        let text = serde_json::to_string(&p).unwrap();
+        assert!(!text.contains("locked"), "{text}");
+    }
+
+    #[test]
+    fn policy_hash_ignores_key_order_and_whitespace_and_sees_a_changed_value() {
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"version":1,"frozen":false,"rules":{"transaction_types":["transfer"]},"approval":{"threshold":{"required":2},"approvers":[{"id":"carol.testnet"},{"id":"daniel.testnet"}],"locked":true},"admin_quorum":null}"#,
+        ).unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            "{ \"admin_quorum\": null, \"approval\": { \"locked\": true, \"approvers\": [ {\"id\": \"carol.testnet\"}, {\"id\": \"daniel.testnet\"} ], \"threshold\": { \"required\": 2 } },\n \"rules\": { \"transaction_types\": [ \"transfer\" ] }, \"frozen\": false, \"version\": 1 }",
+        ).unwrap();
+        assert_eq!(policy_canonical_hash(&a), policy_canonical_hash(&b));
+        assert_eq!(policy_canonical_hash_hex(&a), "149d7d885307be69f752a8bbdc2a5578540958273ea986c7024ee24d8aeea7bf");
+        let mut c = a.clone();
+        c["approval"]["threshold"]["required"] = json!(1);
+        assert_ne!(policy_canonical_hash(&a), policy_canonical_hash(&c));
+        // A re-serialised Value hashes the same: what the coordinator gets from
+        // decrypt-policy and what the keystore parsed from the blob agree.
+        let round: serde_json::Value = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(policy_canonical_hash(&a), policy_canonical_hash(&round));
+    }
+
+    #[test]
+    fn a_lock_needs_a_quorum_somebody_can_meet() {
+        let ok = |v: serde_json::Value| lock_is_satisfiable(&policy_from(v));
+        assert!(ok(json!({})).is_ok());
+        assert!(ok(json!({ "approval": { "threshold": 5 } })).is_ok(), "not locked: anything goes");
+        assert!(ok(json!({ "approval": { "locked": false, "threshold": 5 } })).is_ok());
+        assert!(ok(json!({ "approval": { "locked": true, "threshold": 2, "approvers": [{"id": "a"}, {"id": "b"}] } })).is_ok());
+        assert!(ok(json!({ "approval": { "locked": true, "threshold": {"required": 1}, "approvers": [{"id": "a"}] } })).is_ok());
+
+        let err = |v: serde_json::Value| ok(v).expect_err("must be refused");
+        assert!(err(json!({ "approval": { "locked": true } })).contains("threshold"));
+        assert!(err(json!({ "approval": { "locked": true, "approvers": [{"id": "a"}] } })).contains("threshold"));
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 0, "approvers": [{"id": "a"}] } })).contains("at least 1"));
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 1 } })).contains("approvers"));
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 1, "approvers": [] } })).contains("approvers"));
+        // An approver without an id cannot vote and does not count.
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 1, "approvers": [{"role": "x"}, {"id": "  "}] } })).contains("approvers"));
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 3, "approvers": [{"id": "a"}, {"id": "b"}] } })).contains("never be lifted"));
+        // The deployed default: `{"required": null}` means 2.
+        assert!(err(json!({ "approval": { "locked": true, "threshold": {}, "approvers": [{"id": "a"}] } })).contains("threshold 2"));
+        // One voter listed twice is one voter.
+        assert!(err(json!({ "approval": { "locked": true, "threshold": 2, "approvers": [{"id": "a"}, {"id": "a"}, {"id": " a "}] } })).contains("only 1 distinct"));
+        assert!(ok(json!({ "approval": { "locked": true, "threshold": 2, "approvers": [{"id": "a"}, {"id": "a"}, {"id": "b"}] } })).is_ok());
+    }
+
+    /// A lock does not hold next to raw signing on the NEAR key.
+    #[test]
+    fn a_lock_cannot_leave_raw_signing_on_near_open() {
+        let locked = json!({ "threshold": 1, "approvers": [{"id": "a"}], "locked": true });
+        let err = |caps: serde_json::Value| {
+            lock_is_satisfiable(&policy_from(json!({ "approval": locked, "capabilities": caps })))
+                .expect_err("raw on near under a lock must be refused")
+        };
+        assert!(err(json!({ "raw_sign": { "allowed": true } })).contains("raw signing"));
+        assert!(err(json!({ "raw_sign": { "allowed": true, "chains": ["solana", "NEAR"] } })).contains("raw signing"));
+        let ok = |caps: serde_json::Value| {
+            lock_is_satisfiable(&policy_from(json!({ "approval": locked, "capabilities": caps }))).is_ok()
+        };
+        assert!(ok(json!({})));
+        assert!(ok(json!({ "raw_sign": { "allowed": false } })));
+        assert!(ok(json!({ "raw_sign": { "allowed": true, "chains": ["solana"] } })));
+        // Unlocked: the owner's choice, as before.
+        assert!(lock_is_satisfiable(&policy_from(json!({
+            "approval": { "threshold": 1, "approvers": [{"id": "a"}] },
+            "capabilities": { "raw_sign": { "allowed": true } }
+        })))
+        .is_ok());
+
+        // And a stored locked policy that somehow has it open still refuses the op.
+        let stored = policy_from(json!({ "approval": locked, "capabilities": { "raw_sign": { "allowed": true } } }));
+        let near = Op::Raw { chain: "near".into(), payload_hash: "00".repeat(32), label: None };
+        match evaluate(&stored, &near, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("locked"), "{reason}"),
+            d => panic!("expected Deny, got {d:?}"),
+        }
+        let solana = Op::Raw { chain: "solana".into(), payload_hash: "00".repeat(32), label: None };
+        assert_eq!(evaluate(&stored, &solana, None, 0), Decision::Allow, "the lock is about the NEAR key");
     }
 
     #[test]
