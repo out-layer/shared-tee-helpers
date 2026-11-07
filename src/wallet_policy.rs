@@ -61,6 +61,104 @@ impl RecipientType {
     }
 }
 
+/// wNEAR's asset id inside `intents.near`: what an [`Op::IntentsStorageDeposit`] spends.
+pub const INTENTS_WNEAR_TOKEN: &str = "nep141:wrap.near";
+
+// ===========================================================================
+// SECURITY — CALLS TO THE INTENTS CONTRACT ARE FENCED. DO NOT REMOVE OR NARROW.
+// ===========================================================================
+//
+// `intents.near` authenticates a direct call by its PREDECESSOR: a transaction
+// from the wallet's own NEAR account is the wallet as far as the contract is
+// concerned (`ensure_auth_predecessor_id`, on unless the account turned it off).
+// Every such method takes 1 yoctoNEAR, so per-token limits keyed `native` see
+// nothing. Through a plain `Op::Call` an agent could:
+//
+//   * `add_public_key` — attach a key of its own to the wallet's intents
+//     account and sign intents with it outside the TEE, forever. Nothing in a
+//     policy, a freeze or a lock reaches a key already added; this is the one
+//     that makes the fence necessary.
+//   * `ft_withdraw` / `mt_transfer` / … — move any intents balance anywhere,
+//     past the types, the address list and the limits that gate the same move
+//     through `/intents/withdraw` and `/intents/transfer`.
+//
+// A proxy contract does not get round it: the contract checks
+// `env::predecessor_account_id()`, which for a call made by the proxy is the
+// proxy. Three doors make an account we sign for the predecessor of a call to
+// the intents contract, and each is closed here by default:
+//
+//   1. `Op::Call` whose receiver is the intents contract — `intents_call`.
+//   2. `w_execute_extension` (Agent Connect) whose nested promise is aimed at
+//      the intents contract: the BOUND account (the user's own, with its own
+//      intents account) is then the predecessor — `intents_call` too
+//      (`extension_reaches_intents`).
+//   3. `Op::Raw { chain: "near" }`: a signature by the NEAR key over any 32
+//      bytes is a signature over any NEAR transaction, this one included. Only
+//      with `near` listed in `capabilities.raw_sign.chains`; an absent list
+//      means every chain BUT near (`raw_sign_names_near`).
+//
+// Each is default-DENY with or without a policy: the keystore's stand-in for
+// an absent policy opens neither `intents_call` nor raw signing on near, and
+// an owner who wants one writes it, knowing it hands the account over. Every intents
+// operation the product offers has its own endpoint; none goes through `call`.
+//
+// The one exemption is [`GATE_ONLY_INTENTS_METHODS`]: ops the coordinator only
+// EVALUATES to ask the policy about a deposit (never signed — the keystore
+// refuses to sign them). Anything added there must be a method the intents
+// contract does not have.
+//
+// When changing `Op::Call`, `Op::Raw`, the extension decoder, the intents
+// contract, its account names, or what the stand-in policy opens: re-read this
+// block and the keystore's `policy_to_judge_by`, and keep
+// `intents_contract_calls_are_fenced`, `extension_calls_to_intents_are_fenced`
+// and `raw_signing_on_near_needs_near_listed` passing.
+// ===========================================================================
+
+/// The NEAR Intents contract accounts an [`Op::Call`] may reach only with
+/// `capabilities.intents_call`. See the SECURITY block above. `intents.far` is the
+/// confidential shard's verifier, the second name `sign_message` never signs for.
+pub const INTENTS_CONTRACTS: &[&str] = &["intents.near", "intents.far"];
+
+/// Methods named in `Op::Call`s to the intents contract that exist only to be
+/// evaluated by the policy, never signed. None of them is a method of the contract.
+pub const GATE_ONLY_INTENTS_METHODS: &[&str] = &["cross_chain_deposit"];
+
+/// Whether `account` is the intents contract (account ids compared as written,
+/// trimmed and lower-cased: a NEAR account id has one spelling).
+pub fn is_intents_contract(account: &str) -> bool {
+    let a = account.trim().to_ascii_lowercase();
+    INTENTS_CONTRACTS.iter().any(|c| *c == a)
+}
+
+/// Whether an `Op::Call` to `to` calling `method` is fenced by `intents_call`.
+pub fn is_fenced_intents_call(to: &str, method: &str) -> bool {
+    is_intents_contract(to) && !GATE_ONLY_INTENTS_METHODS.contains(&method)
+}
+
+/// The most an [`Op::IntentsStorageDeposit`] may pay, in yoctoNEAR: 0.00125 NEAR, the
+/// minimum of a NEP-141 built on `near-contract-standards` and what `/storage-deposit`
+/// attaches. A token asking more is refused; it is registered through `call` instead.
+pub const INTENTS_STORAGE_DEPOSIT_MAX: u128 = 1_250_000_000_000_000_000_000;
+
+/// The amount of an [`Op::IntentsStorageDeposit`] parsed and held to
+/// `0 < amount <= INTENTS_STORAGE_DEPOSIT_MAX`, or the refusal in words. The keystore,
+/// which signs, and the coordinator, which answers first, both call it.
+pub fn intents_storage_deposit_amount(amount: &str) -> Result<u128, String> {
+    let value: u128 = amount
+        .parse()
+        .map_err(|_| format!("storage deposit amount '{amount}' is not an integer"))?;
+    if value == 0 {
+        return Err("a storage deposit of 0 pays nothing".to_string());
+    }
+    if value > INTENTS_STORAGE_DEPOSIT_MAX {
+        return Err(format!(
+            "the storage deposit is {value} yoctoNEAR, above the {INTENTS_STORAGE_DEPOSIT_MAX} this pays from \
+             intents; register through a call instead"
+        ));
+    }
+    Ok(value)
+}
+
 /// Field-naming convention (single source of truth): `to` (never `receiver_id`),
 /// `amount` as a yocto/raw-unit decimal STRING (never a JSON number).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +207,31 @@ pub enum Op {
         to: String,
         amount: String,
         token: String,
+    },
+
+    /// Register `account_id` on the NEP-141 contract `contract_id`, paid with `amount`
+    /// yoctoNEAR of the wallet's wNEAR inside `intents.near` (the defuse
+    /// `storage_deposit` intent), gasless via the solver relay. Built: the keystore
+    /// constructs the intent from these fields.
+    ///
+    /// The contract unwraps the wNEAR and calls `storage_deposit` on `contract_id` in a
+    /// detached promise, and never refunds the wNEAR: a deposit refused by the token
+    /// contract, an excess above its minimum, or a deposit for an account already
+    /// registered all go back to `intents.near`, not to the wallet. So `amount` is the
+    /// contract's `storage_balance_bounds().min` exactly and `account_id` must be
+    /// unregistered; the keystore reads both before it signs.
+    ///
+    /// The amount is also capped at [`INTENTS_STORAGE_DEPOSIT_MAX`]: `contract_id` is the
+    /// caller's choice, and its `min` is whatever that contract answers — a contract of
+    /// the agent's own could name the whole balance and keep it.
+    ///
+    /// Gated by its own `intents_storage_deposit` type only (not `call`: it spends the
+    /// intents balance), `contract_id` as the destination (where the NEAR goes), the
+    /// wNEAR as the token for limits and velocity.
+    IntentsStorageDeposit {
+        contract_id: String,
+        account_id: String,
+        amount: String,
     },
 
     /// Raw payload signing (e.g. an Ethereum tx). Hash-pinned: the op carries the
@@ -281,8 +404,8 @@ pub fn policy_canonical_hash_hex(policy: &serde_json::Value) -> String {
     hex::encode(policy_canonical_hash(policy))
 }
 
-/// Whether raw signing on the NEAR key is open: `raw_sign.allowed` with no
-/// `chains` list, or one that names `near`.
+/// Whether raw signing on the NEAR key is open: `raw_sign.allowed` with a
+/// `chains` list that names `near` ([`raw_sign_names_near`]).
 ///
 /// The NEAR raw key IS the wallet's transaction key, and a raw signature over
 /// 32 caller-chosen bytes is a signature over any transaction hash — and over
@@ -295,10 +418,18 @@ fn raw_signing_on_near_is_open(policy: &Policy) -> bool {
     if !cap.allowed.unwrap_or(false) {
         return false;
     }
-    match cap.chains.as_ref() {
-        None => true,
-        Some(chains) => chains.iter().any(|c| c.eq_ignore_ascii_case("near")),
-    }
+    raw_sign_names_near(cap)
+}
+
+/// SECURITY: raw signing on the NEAR key is opened only by NAMING `near` in
+/// `raw_sign.chains`; an absent list opens every other chain. The NEAR key signs
+/// the wallet's transactions, so a raw signature by it over 32 caller-chosen
+/// bytes is any transaction — a call to the intents contract included. See the
+/// block at [`INTENTS_CONTRACTS`].
+pub fn raw_sign_names_near(cap: &Capability) -> bool {
+    cap.chains
+        .as_ref()
+        .is_some_and(|chains| chains.iter().any(|c| c.trim().eq_ignore_ascii_case("near")))
 }
 
 /// Whether a policy that asks to be locked can ever be unlocked, and holds.
@@ -505,7 +636,8 @@ pub fn bind_mode(op: &Op) -> BindMode {
         | Op::Call { .. }
         | Op::Delete { .. }
         | Op::Withdraw { .. }
-        | Op::IntentsTransfer { .. } => BindMode::Built,
+        | Op::IntentsTransfer { .. }
+        | Op::IntentsStorageDeposit { .. } => BindMode::Built,
         Op::Raw { .. } | Op::SignMessage { .. } => BindMode::HashPinned,
         Op::Swap { .. }
         | Op::Confidential { .. }
@@ -577,6 +709,10 @@ impl Op {
             // is native NEAR, nor `withdraw`): a policy must explicitly list `intents_transfer`
             // to permit it. Gated by the `to` whitelist + per-token amount limit like withdraw.
             Op::IntentsTransfer { .. } => &["intents_transfer"],
+            // Its OWN type, like intents_transfer: it spends the intents balance, which a
+            // `call` (or the legacy `storage_deposit`) never permitted, so a policy lists it
+            // to permit it.
+            Op::IntentsStorageDeposit { .. } => &["intents_storage_deposit"],
             // Cross-chain is the riskiest exit (irreversible, leaves NEAR via a bridge),
             // so it is gated by its OWN type — NOT folded into `withdraw`/`intents_withdraw`.
             // A policy must explicitly list `cross_chain_withdraw` to permit it (default-DENY
@@ -613,6 +749,8 @@ impl Op {
             | Op::CrossChainWithdraw { token, .. }
             | Op::LimitOrder { token, .. }
             | Op::PaymentCheck { token, .. } => token,
+            // The wNEAR that leaves the wallet's intents balance.
+            Op::IntentsStorageDeposit { .. } => INTENTS_WNEAR_TOKEN,
             Op::Swap { token_in, .. } => token_in,
             Op::Raw { .. } | Op::SignMessage { .. } | Op::Auth { .. } | Op::PolicyUpdate { .. } => {
                 "native"
@@ -627,6 +765,7 @@ impl Op {
             Op::Transfer { amount, .. }
             | Op::Withdraw { amount, .. }
             | Op::IntentsTransfer { amount, .. }
+            | Op::IntentsStorageDeposit { amount, .. }
             | Op::Confidential { amount, .. }
             | Op::CrossChainWithdraw { amount, .. }
             | Op::LimitOrder { amount, .. }
@@ -650,6 +789,8 @@ impl Op {
             | Op::CrossChainWithdraw { to, .. }
             | Op::LimitOrder { to, .. } => Some(to),
             Op::Call { to, .. } => Some(to),
+            // Where the NEAR goes, as `/storage-deposit`'s `Op::Call.to`.
+            Op::IntentsStorageDeposit { contract_id, .. } => Some(contract_id),
             Op::Delete { beneficiary, .. } => Some(beneficiary),
             Op::Confidential { to, .. } => to.as_deref(),
             // PaymentCheck carries NO destination on purpose — the ephemeral escrow would
@@ -665,7 +806,8 @@ impl Op {
     }
 
     /// Whether this op participates in the generic approval-threshold trigger: every
-    /// fund-moving kind — Built (transfer/call/delete/withdraw/intents_transfer) AND the
+    /// fund-moving kind — Built (transfer/call/delete/withdraw/intents_transfer/
+    /// intents_storage_deposit) AND the
     /// Trusted kinds swap/confidential/cross_chain_withdraw/limit_order/payment_check. For
     /// Built/HashPinned the approver signature binds to exactly what executes (constructed
     /// from the op / pinned by hash). For Trusted the approval is OWNER CONTROL: it gates
@@ -684,6 +826,7 @@ impl Op {
                 | Op::Delete { .. }
                 | Op::Withdraw { .. }
                 | Op::IntentsTransfer { .. }
+                | Op::IntentsStorageDeposit { .. }
                 | Op::Swap { .. }
                 | Op::Confidential { .. }
                 | Op::CrossChainWithdraw { .. }
@@ -899,6 +1042,14 @@ pub struct Capabilities {
     /// be bypassed through the message endpoint.
     #[serde(default)]
     pub solana_sign: Option<Capability>,
+    /// A `call` to the NEAR Intents contract itself (`intents.near`), directly or as a
+    /// `w_execute_extension` promise of the bound account. **Default-DENY, with or
+    /// without a policy**: the contract takes the calling account as the owner, so such
+    /// a call can add a key that signs for that account's intents balance forever, or
+    /// move any of it past every limit. See the SECURITY block at [`INTENTS_CONTRACTS`].
+    /// Needs `call` permitted as well.
+    #[serde(default)]
+    pub intents_call: Option<Capability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -908,7 +1059,8 @@ pub struct Capability {
     #[serde(default)]
     pub requires_approval: Option<bool>,
     /// `raw_sign` only: restrict which chains may be raw-signed. `Some(list)` → the op's
-    /// chain must be in the list; absent → all chains (including `near`).
+    /// chain must be in the list; absent → every chain EXCEPT `near`, which is opened only
+    /// by naming it (SECURITY: see [`raw_sign_names_near`]).
     #[serde(default)]
     pub chains: Option<Vec<String>>,
     /// `sign_message` only: the auth recipients this wallet may sign messages for. The
@@ -2043,6 +2195,28 @@ fn check_capabilities(
         // A limit order pays out unattended, to an address of the caller's choosing →
         // default-DENY on the same footing as the exit it can become.
         Op::LimitOrder { .. } => (caps.and_then(|c| c.limit_order.as_ref()), false),
+        // SECURITY: a call to the intents contract acts as the wallet's intents
+        // account itself — default-DENY. See the block at `INTENTS_CONTRACTS`.
+        Op::Call { to, method, .. } if is_fenced_intents_call(to, method) => {
+            return intents_call_decision(
+                caps,
+                approval,
+                format!("A call to '{to}' is refused: it would act as this wallet's intents account"),
+            );
+        }
+        // SECURITY: an Agent Connect request whose nested promise is aimed at the
+        // intents contract acts as the BOUND account's intents account. Same gate.
+        Op::Call { method, args_base64, .. }
+            if method == "w_execute_extension" && extension_reaches_intents(args_base64) =>
+        {
+            return intents_call_decision(
+                caps,
+                approval,
+                "A w_execute_extension promise aimed at the intents contract is refused: it would \
+                 act as the bound account's intents account"
+                    .to_string(),
+            );
+        }
         _ => return None,
     };
 
@@ -2056,6 +2230,15 @@ fn check_capabilities(
 
     // raw_sign chain restriction: when `chains` is configured, the op's chain must be in it.
     if let Op::Raw { chain, .. } = op {
+        // SECURITY: near only when named — an absent list does not open it. A list
+        // that omits near is refused just below, in the list's own words.
+        if chain.trim().eq_ignore_ascii_case("near") && cap.and_then(|c| c.chains.as_ref()).is_none() {
+            return Some(deny(
+                "Raw signing on near is refused: a raw signature by the NEAR key is any NEAR \
+                 transaction. An owner who means it lists \"near\" in capabilities.raw_sign.chains"
+                    .to_string(),
+            ));
+        }
         if let Some(chains) = cap.and_then(|c| c.chains.as_ref()) {
             if !chains.iter().any(|c| c == chain) {
                 return Some(deny(format!(
@@ -2071,6 +2254,41 @@ fn check_capabilities(
     }
 
     confidential_demand
+}
+
+/// SECURITY: the `intents_call` gate, for every door that makes an account we sign
+/// for the predecessor of a call to the intents contract. Default-DENY; see the
+/// block at [`INTENTS_CONTRACTS`].
+fn intents_call_decision(
+    caps: Option<&Capabilities>,
+    approval: Option<&Approval>,
+    refused: String,
+) -> Option<Decision> {
+    let cap = caps.and_then(|c| c.intents_call.as_ref());
+    if !cap.and_then(|c| c.allowed).unwrap_or(false) {
+        return Some(deny(format!(
+            "{refused} (add a key, move any balance). Use the /wallet/v1/intents/* endpoints; an \
+             owner who means it sets capabilities.intents_call.allowed"
+        )));
+    }
+    if cap.and_then(|c| c.requires_approval).unwrap_or(false) {
+        return Some(approval_demand(approval, "intents_call"));
+    }
+    None
+}
+
+/// Whether a `w_execute_extension` request has a promise whose receiver is the
+/// intents contract. A request that does not decode is refused earlier
+/// (`evaluate_extension_call`), so it reads `false` here.
+fn extension_reaches_intents(args_base64: &str) -> bool {
+    use crate::wallet_request_decode::{decode, effects};
+    use base64::Engine;
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(args_base64) else {
+        return false;
+    };
+    let Ok(envelope) = decode(&raw) else { return false };
+    let Ok(fx) = effects(&envelope, raw.len()) else { return false };
+    fx.receivers.iter().any(|r| is_intents_contract(r))
 }
 
 /// What a capability's `requires_approval` turns into. The threshold comes from the
@@ -2795,6 +3013,134 @@ mod tests {
         assert!(matches!(evaluate(&allow, &bad_to, None, 0), Decision::Deny { .. }));
     }
 
+    fn intents_storage_deposit_op() -> Op {
+        Op::IntentsStorageDeposit {
+            contract_id: "usdc.near".into(),
+            account_id: "fresh.near".into(),
+            amount: "1250000000000000000000".into(),
+        }
+    }
+
+    /// Paying a receiver's storage from intents spends the intents balance, so only its
+    /// own type permits it — never `call` or the legacy `storage_deposit`, which did not
+    /// reach that balance; the token contract is the destination; the wNEAR is the token.
+    #[test]
+    fn intents_storage_deposit_is_permitted_by_its_own_type_only() {
+        let op = intents_storage_deposit_op();
+        assert_eq!(bind_mode(&op), BindMode::Built);
+        assert_eq!(op.primary_type(), "intents_storage_deposit");
+        assert_eq!(op.type_aliases(), &["intents_storage_deposit"]);
+        assert_eq!(op.token(), "nep141:wrap.near");
+        assert_eq!(op.amount(), Some("1250000000000000000000"));
+        assert_eq!(op.destination(), Some("usdc.near"));
+        assert!(op.triggers_generic_approval());
+        assert_eq!(
+            canonical_json(&op),
+            r#"{"account_id":"fresh.near","amount":"1250000000000000000000","contract_id":"usdc.near","kind":"intents_storage_deposit"}"#
+        );
+
+        let own: Policy = serde_json::from_str(r#"{"rules":{"transaction_types":["intents_storage_deposit"]}}"#).unwrap();
+        assert!(matches!(evaluate(&own, &op, None, 0), Decision::Allow));
+        for allowed in [r#"["call"]"#, r#"["storage_deposit"]"#, r#"["call","transfer","intents_transfer","withdraw"]"#] {
+            let p: Policy = serde_json::from_str(&format!(r#"{{"rules":{{"transaction_types":{allowed}}}}}"#)).unwrap();
+            match evaluate(&p, &op, None, 0) {
+                Decision::Deny { reason } => assert!(reason.contains("'intents_storage_deposit'"), "{reason}"),
+                d => panic!("{allowed} permitted spending the intents balance on storage: {d:?}"),
+            }
+        }
+
+        // The whitelist is held to the token contract, as for `/storage-deposit`.
+        let listed: Policy = serde_json::from_str(r#"{"rules":{"addresses":{"mode":"whitelist","list":["usdc.near"]}}}"#).unwrap();
+        assert!(matches!(evaluate(&listed, &op, None, 0), Decision::Allow));
+        let unlisted: Policy = serde_json::from_str(r#"{"rules":{"addresses":{"mode":"whitelist","list":["fresh.near"]}}}"#).unwrap();
+        assert!(matches!(evaluate(&unlisted, &op, None, 0), Decision::Deny { .. }));
+
+        // A wNEAR per-transaction limit applies to it.
+        let capped: Policy = serde_json::from_str(r#"{"rules":{"limits":{"per_transaction":{"nep141:wrap.near":"1000"}}}}"#).unwrap();
+        assert!(matches!(evaluate(&capped, &op, None, 0), Decision::Deny { .. }));
+
+        let frozen: Policy = serde_json::from_str(r#"{"frozen":true}"#).unwrap();
+        assert!(!matches!(evaluate(&frozen, &op, None, 0), Decision::Allow));
+
+        let multisig: Policy = serde_json::from_str(r#"{"approval":{"threshold":{"required":2},"approvers":[{"id":"a"},{"id":"b"}]}}"#).unwrap();
+        assert!(matches!(evaluate(&multisig, &op, None, 0), Decision::RequiresApproval { .. }));
+    }
+
+    fn intents_call(method: &str) -> Op {
+        Op::Call {
+            to: "intents.near".into(),
+            method: method.into(),
+            args_base64: "e30=".into(),
+            gas: "30000000000000".into(),
+            deposit: "1".into(),
+        }
+    }
+
+    /// SECURITY guard for the block at `INTENTS_CONTRACTS`: a call to the intents
+    /// contract is refused unless the owner wrote `intents_call`, and `call` alone
+    /// never opens it.
+    #[test]
+    fn intents_contract_calls_are_fenced() {
+        let methods = ["add_public_key", "ft_withdraw", "mt_transfer", "native_withdraw", "disable_auth_by_predecessor_id"];
+        let open_call: Policy = serde_json::from_str(r#"{"rules":{"transaction_types":["call"]}}"#).unwrap();
+        let no_types: Policy = serde_json::from_str(r#"{}"#).unwrap();
+        // Every other capability opened, as the keystore's stand-in for no policy does.
+        let all_but: Policy = serde_json::from_str(
+            r#"{"capabilities":{"raw_sign":{"allowed":true},"confidential":{"allowed":true},"payment_check":{"allowed":true},
+                "swap":{"allowed":true},"cross_chain_withdraw":{"allowed":true},"limit_order":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        for m in methods {
+            for (name, p) in [("call", &open_call), ("{}", &no_types), ("every other capability", &all_but)] {
+                match evaluate(p, &intents_call(m), None, 0) {
+                    Decision::Deny { reason } => assert!(reason.contains("intents_call"), "{reason}"),
+                    d => panic!("{name} let a call to intents.near {m} through: {d:?}"),
+                }
+            }
+        }
+        for to in ["INTENTS.NEAR", " intents.near "] {
+            let op = Op::Call { to: to.into(), method: "add_public_key".into(), args_base64: "e30=".into(), gas: "1".into(), deposit: "1".into() };
+            assert!(matches!(evaluate(&open_call, &op, None, 0), Decision::Deny { .. }), "{to:?} passed");
+        }
+
+        // The owner opens it on purpose; `call` must be permitted as well.
+        let opened: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["call"]},"capabilities":{"intents_call":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&opened, &intents_call("add_public_key"), None, 0), Decision::Allow));
+        let opened_no_call: Policy = serde_json::from_str(
+            r#"{"rules":{"transaction_types":["transfer"]},"capabilities":{"intents_call":{"allowed":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&opened_no_call, &intents_call("add_public_key"), None, 0), Decision::Deny { .. }));
+        let with_approval: Policy = serde_json::from_str(
+            r#"{"capabilities":{"intents_call":{"allowed":true,"requires_approval":true}},
+                "approval":{"threshold":{"required":1},"approvers":[{"id":"a"}]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(evaluate(&with_approval, &intents_call("ft_withdraw"), None, 0), Decision::RequiresApproval { .. }));
+
+        // The gate-only deposit question is still answered; other contracts are untouched.
+        assert!(matches!(evaluate(&open_call, &intents_call("cross_chain_deposit"), None, 0), Decision::Allow));
+        let elsewhere = Op::Call { to: "usdc.near".into(), method: "ft_transfer".into(), args_base64: "e30=".into(), gas: "1".into(), deposit: "1".into() };
+        assert!(matches!(evaluate(&open_call, &elsewhere, None, 0), Decision::Allow));
+        for m in GATE_ONLY_INTENTS_METHODS {
+            assert!(!methods.contains(m), "{m} is a real intents method and cannot be gate-only");
+        }
+    }
+
+    /// The amount is the caller's contract's answer, so it is capped where it is read.
+    #[test]
+    fn an_intents_storage_deposit_pays_at_most_the_standard_minimum() {
+        assert_eq!(INTENTS_STORAGE_DEPOSIT_MAX, 1_250_000_000_000_000_000_000);
+        assert_eq!(intents_storage_deposit_amount("1250000000000000000000"), Ok(INTENTS_STORAGE_DEPOSIT_MAX));
+        assert_eq!(intents_storage_deposit_amount("1"), Ok(1));
+        for bad in ["1250000000000000000001", "0", "", "-1", "1e21", "340282366920938463463374607431768211456"] {
+            assert!(intents_storage_deposit_amount(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
     #[test]
     fn swap_is_default_deny_capability_even_without_transaction_types() {
         // The closed hole: gating Swap only via `transaction_types` left it UNGATED when
@@ -3250,15 +3596,17 @@ mod tests {
             lock_is_satisfiable(&policy_from(json!({ "approval": locked, "capabilities": caps })))
                 .expect_err("raw on near under a lock must be refused")
         };
-        assert!(err(json!({ "raw_sign": { "allowed": true } })).contains("raw signing"));
         assert!(err(json!({ "raw_sign": { "allowed": true, "chains": ["solana", "NEAR"] } })).contains("raw signing"));
+        assert!(err(json!({ "raw_sign": { "allowed": true, "chains": [" near "] } })).contains("raw signing"));
         let ok = |caps: serde_json::Value| {
             lock_is_satisfiable(&policy_from(json!({ "approval": locked, "capabilities": caps }))).is_ok()
         };
         assert!(ok(json!({})));
         assert!(ok(json!({ "raw_sign": { "allowed": false } })));
         assert!(ok(json!({ "raw_sign": { "allowed": true, "chains": ["solana"] } })));
-        // Unlocked: the owner's choice, as before.
+        // No list opens every chain but near, so it leaves the lock standing.
+        assert!(ok(json!({ "raw_sign": { "allowed": true } })));
+        // Unlocked: the owner's choice.
         assert!(lock_is_satisfiable(&policy_from(json!({
             "approval": { "threshold": 1, "approvers": [{"id": "a"}] },
             "capabilities": { "raw_sign": { "allowed": true } }
@@ -3266,7 +3614,7 @@ mod tests {
         .is_ok());
 
         // And a stored locked policy that somehow has it open still refuses the op.
-        let stored = policy_from(json!({ "approval": locked, "capabilities": { "raw_sign": { "allowed": true } } }));
+        let stored = policy_from(json!({ "approval": locked, "capabilities": { "raw_sign": { "allowed": true, "chains": ["near", "solana"] } } }));
         let near = Op::Raw { chain: "near".into(), payload_hash: "00".repeat(32), label: None };
         match evaluate(&stored, &near, None, 0) {
             Decision::Deny { reason } => assert!(reason.contains("locked"), "{reason}"),
@@ -3681,9 +4029,65 @@ mod tests {
             Decision::Deny { .. } => {}
             d => panic!("expected deny for near, got {:?}", d),
         }
-        // No chains key → all chains allowed (incl near).
+        // No chains key → every chain but near.
         let policy_all = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true } } }));
-        assert_eq!(evaluate(&policy_all, &near, None, 0), Decision::Allow);
+        assert!(matches!(evaluate(&policy_all, &near, None, 0), Decision::Deny { .. }));
+        assert_eq!(evaluate(&policy_all, &eth, None, 0), Decision::Allow);
+    }
+
+    /// SECURITY guard for door 3 of the block at `INTENTS_CONTRACTS`: the NEAR key
+    /// signs raw bytes only when the owner NAMED near; an absent list never opens it.
+    #[test]
+    fn raw_signing_on_near_needs_near_listed() {
+        let near = Op::Raw { chain: "near".into(), payload_hash: "ab".into(), label: None };
+        let near_upper = Op::Raw { chain: " NEAR".into(), payload_hash: "ab".into(), label: None };
+        let solana = Op::Raw { chain: "solana".into(), payload_hash: "ab".into(), label: None };
+        // As the keystore's stand-in for a wallet with no policy opens it: no list.
+        let open = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true } } }));
+        for op in [&near, &near_upper] {
+            match evaluate(&open, op, None, 0) {
+                Decision::Deny { reason } => assert!(reason.contains("raw_sign.chains"), "{reason}"),
+                d => panic!("raw near passed without being named: {d:?}"),
+            }
+        }
+        assert_eq!(evaluate(&open, &solana, None, 0), Decision::Allow);
+        let named = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true, "chains": ["near"] } } }));
+        assert_eq!(evaluate(&named, &near, None, 0), Decision::Allow);
+        let empty = policy_from(json!({ "capabilities": { "raw_sign": { "allowed": true, "chains": [] } } }));
+        assert!(matches!(evaluate(&empty, &near, None, 0), Decision::Deny { .. }));
+    }
+
+    fn extension_to(receiver: &str) -> Op {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let request = format!(
+            r#"{{"request":{{"external":[{{"receiver_id":"{receiver}","actions":[{{"action":"function_call","payload":{{"function_name":"storage_deposit","args":"{}","deposit":"1250000000000000000000"}}}}]}}]}}}}"#,
+            b64(r#"{"account_id":"bob.near"}"#)
+        );
+        Op::Call {
+            to: "alice.near".into(),
+            method: "w_execute_extension".into(),
+            args_base64: b64(&request),
+            gas: "100000000000000".into(),
+            deposit: "1".into(),
+        }
+    }
+
+    /// SECURITY guard for door 2 of the block at `INTENTS_CONTRACTS`: a nested
+    /// promise aimed at the intents contract makes the BOUND account the caller;
+    /// it needs `intents_call` like a direct call. Any other receiver is untouched.
+    #[test]
+    fn extension_calls_to_intents_are_fenced() {
+        let open = policy_from(json!({}));
+        match evaluate(&open, &extension_to("intents.near"), None, 0) {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("intents_call") && reason.contains("bound account"), "{reason}")
+            }
+            d => panic!("a nested call to intents.near passed: {d:?}"),
+        }
+        assert_eq!(evaluate(&open, &extension_to("usdc.near"), None, 0), Decision::Allow);
+        let opened = policy_from(json!({ "capabilities": { "intents_call": { "allowed": true } } }));
+        assert_eq!(evaluate(&opened, &extension_to("intents.near"), None, 0), Decision::Allow);
     }
 
     #[test]
