@@ -135,6 +135,189 @@ pub fn is_fenced_intents_call(to: &str, method: &str) -> bool {
     is_intents_contract(to) && !GATE_ONLY_INTENTS_METHODS.contains(&method)
 }
 
+// ===========================================================================
+// SECURITY — WHAT A TRUSTED ARTIFACT MAY SAY. DO NOT WIDEN.
+// ===========================================================================
+//
+// A Trusted op (swap, cross-chain withdraw, limit order, payment check,
+// confidential) is signed over a NEP-413 message the keystore did not build:
+// the coordinator builds it, or relays it from 1Click's `generate-intent`. The
+// intents contract executes whatever intents that message carries, and its
+// `Intent` enum includes `add_public_key`, `remove_public_key`,
+// `set_auth_by_predecessor_id` and `auth_call` — one of those signed once hands
+// the account over for good (see the block at `INTENTS_CONTRACTS`).
+//
+// Every Trusted flow moves value one way: ONE `transfer` of ONE token, from
+// this wallet, to a deposit address. So the keystore signs a Trusted artifact
+// only when its message is exactly that ([`parse_trusted_transfer`]) and the
+// transfer fits the op the policy and the approvers judged
+// ([`trusted_transfer_fits_op`]): the wallet as signer, the op's token, no more
+// than the op's amount. The receiver is the one thing left to the caller: the
+// deposit address exists only after the quote. The coordinator holds the
+// receiver and the exact amount to 1Click's quote on top of this.
+//
+// Two callers, one definition — change the shape HERE, and both follow:
+//   * keystore-worker/src/api.rs `trusted_artifact_refusal`, called by
+//     `sign_trusted` before every Trusted signature (shape + signer + token +
+//     amount no more than the op's);
+//   * outlayer-coordinator src/wallet/limit_order_handlers.rs `FundingIntent::parse`
+//     (limit orders) and src/wallet/confidential/handlers.rs `held_to_the_quote`
+//     (confidential operations): shape + the quote's deposit address and exact
+//     amount, before the keystore is asked.
+// ===========================================================================
+
+/// The fields a Trusted transfer intent may carry, and no other. A transfer on
+/// the intents contract takes a receiver and tokens, and may carry a memo
+/// (refused unless null). A field this list does not name — a notification
+/// call, say — is an effect nobody here has read.
+pub const TRUSTED_TRANSFER_FIELDS: &[&str] = &["intent", "receiver_id", "tokens", "memo"];
+
+/// The one transfer a Trusted artifact's NEP-413 message carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedTransfer {
+    pub signer_id: String,
+    pub receiver_id: String,
+    pub token: String,
+    pub amount: String,
+    /// The message's deadline as written (RFC 3339), when it has one.
+    pub deadline: Option<String>,
+}
+
+/// Read a Trusted artifact's message: JSON naming a `signer_id` and carrying
+/// exactly one intent, a `transfer` with no field beyond
+/// [`TRUSTED_TRANSFER_FIELDS`], no memo, and exactly one token with a string
+/// amount. Anything else is refused in words.
+pub fn parse_trusted_transfer(message: &str) -> Result<TrustedTransfer, String> {
+    refuse_duplicate_keys(message)?;
+    let v: serde_json::Value =
+        serde_json::from_str(message).map_err(|e| format!("message is not JSON: {e}"))?;
+    let signer_id = v
+        .get("signer_id")
+        .and_then(|s| s.as_str())
+        .ok_or("message names no signer_id")?
+        .to_string();
+    let intents = v
+        .get("intents")
+        .and_then(|i| i.as_array())
+        .ok_or("message carries no intents")?;
+    let [intent] = intents.as_slice() else {
+        return Err(format!("message carries {} intents, not one", intents.len()));
+    };
+    let kind = intent.get("intent").and_then(|k| k.as_str()).unwrap_or_default();
+    if kind != "transfer" {
+        return Err(format!("intent is {kind:?}, not a transfer"));
+    }
+    if intent.get("memo").is_some_and(|m| !m.is_null()) {
+        return Err("transfer carries a memo".to_string());
+    }
+    if let Some(unknown) = intent
+        .as_object()
+        .and_then(|o| o.keys().find(|k| !TRUSTED_TRANSFER_FIELDS.contains(&k.as_str())))
+    {
+        return Err(format!("transfer carries a field nobody here reads: {unknown}"));
+    }
+    let receiver_id = intent
+        .get("receiver_id")
+        .and_then(|r| r.as_str())
+        .ok_or("transfer names no receiver_id")?
+        .to_string();
+    let tokens = intent
+        .get("tokens")
+        .and_then(|t| t.as_object())
+        .ok_or("transfer carries no tokens")?;
+    let mut tokens = tokens.iter();
+    let (Some((token, amount)), None) = (tokens.next(), tokens.next()) else {
+        return Err("transfer carries more or fewer than one token".to_string());
+    };
+    let amount = amount.as_str().ok_or("transfer amount is not a string")?.to_string();
+    let deadline = v.get("deadline").and_then(|d| d.as_str()).map(str::to_string);
+    Ok(TrustedTransfer { signer_id, receiver_id, token: token.clone(), amount, deadline })
+}
+
+/// SECURITY: a message with the same key twice, at any depth, is refused. Read
+/// into a `serde_json::Value`, the LAST copy wins; the contract reads its own
+/// structs, and `DefusePayload` takes `intents` through `#[serde(flatten)]`,
+/// where which copy counts is not something this code should depend on. Two
+/// readers that could disagree about which `intents` the message carries would
+/// let one sign what the other executes.
+fn refuse_duplicate_keys(message: &str) -> Result<(), String> {
+    use serde::de::{DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
+
+    struct Walk;
+    impl<'de> DeserializeSeed<'de> for Walk {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(Walk)
+        }
+    }
+    impl<'de> Visitor<'de> for Walk {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E: Error>(self, _: bool) -> Result<(), E> { Ok(()) }
+        fn visit_i64<E: Error>(self, _: i64) -> Result<(), E> { Ok(()) }
+        fn visit_u64<E: Error>(self, _: u64) -> Result<(), E> { Ok(()) }
+        fn visit_f64<E: Error>(self, _: f64) -> Result<(), E> { Ok(()) }
+        fn visit_str<E: Error>(self, _: &str) -> Result<(), E> { Ok(()) }
+        fn visit_unit<E: Error>(self) -> Result<(), E> { Ok(()) }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element_seed(Walk)?.is_some() {}
+            Ok(())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            let mut seen = BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(A::Error::custom(format!("the key {key:?} appears twice")));
+                }
+                map.next_value_seed(Walk)?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(message);
+    Walk.deserialize(&mut de).map_err(|e| format!("message is not JSON with one copy of each key: {e}"))?;
+    de.end().map_err(|e| format!("message is not JSON: {e}"))
+}
+
+/// A token as the intents contract names it: native NEAR moves there as wNEAR.
+fn as_intents_token(token: &str) -> &str {
+    match token.trim() {
+        "native" | "near" | "" => INTENTS_WNEAR_TOKEN,
+        t => t,
+    }
+}
+
+/// Whether a Trusted transfer is within the op it is signed under: `signer` (the
+/// wallet's own account) sends it, in the op's token, no more than the op's amount.
+pub fn trusted_transfer_fits_op(t: &TrustedTransfer, op: &Op, signer: &str) -> Result<(), String> {
+    if bind_mode(op) != BindMode::Trusted {
+        return Err(format!("a {} op is not signed over an artifact", op.primary_type()));
+    }
+    if t.signer_id != signer {
+        return Err(format!("the transfer's signer is {}, not this wallet", t.signer_id));
+    }
+    if as_intents_token(&t.token) != as_intents_token(op.token()) {
+        return Err(format!(
+            "the transfer moves {}, the {} was authorised in {}",
+            t.token,
+            op.primary_type(),
+            op.token()
+        ));
+    }
+    let moved: u128 = t.amount.parse().map_err(|_| format!("transfer amount '{}' is not an integer", t.amount))?;
+    let authorised: u128 = op
+        .amount()
+        .and_then(|a| a.parse().ok())
+        .ok_or_else(|| format!("the {} op carries no amount to hold the transfer to", op.primary_type()))?;
+    if moved > authorised {
+        return Err(format!("the transfer moves {moved}, the op authorised {authorised}"));
+    }
+    Ok(())
+}
+
 /// The most an [`Op::IntentsStorageDeposit`] may pay, in yoctoNEAR: 0.00125 NEAR, the
 /// minimum of a NEP-141 built on `near-contract-standards` and what `/storage-deposit`
 /// attaches. A token asking more is refused; it is registered through `call` instead.
@@ -3128,6 +3311,85 @@ mod tests {
         for m in GATE_ONLY_INTENTS_METHODS {
             assert!(!methods.contains(m), "{m} is a real intents method and cannot be gate-only");
         }
+    }
+
+    fn transfer_msg(intents: serde_json::Value) -> String {
+        json!({"signer_id": "me.near", "deadline": "2026-11-08T12:00:00Z", "intents": intents}).to_string()
+    }
+
+    /// SECURITY guard for the block above `TRUSTED_TRANSFER_FIELDS`: a Trusted artifact is
+    /// one plain transfer or it is not signed — the account-control intents above all.
+    #[test]
+    fn a_trusted_artifact_is_one_plain_transfer() {
+        let ok = transfer_msg(json!([{"intent":"transfer","receiver_id":"dep.near","tokens":{"nep141:usdc.near":"10"}}]));
+        let t = parse_trusted_transfer(&ok).unwrap();
+        assert_eq!((t.signer_id.as_str(), t.receiver_id.as_str(), t.token.as_str(), t.amount.as_str()),
+                   ("me.near", "dep.near", "nep141:usdc.near", "10"));
+        assert!(parse_trusted_transfer(&transfer_msg(json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"},"memo":null}]))).is_ok());
+
+        for (why, intents) in [
+            ("add_public_key", json!([{"intent":"add_public_key","public_key":"ed25519:x"}])),
+            ("remove_public_key", json!([{"intent":"remove_public_key","public_key":"ed25519:x"}])),
+            ("set_auth_by_predecessor_id", json!([{"intent":"set_auth_by_predecessor_id","enabled":true}])),
+            ("auth_call", json!([{"intent":"auth_call","contract_id":"c.near","msg":""}])),
+            ("ft_withdraw", json!([{"intent":"ft_withdraw","token":"usdc.near","receiver_id":"x","amount":"1"}])),
+            // Only the kind differs from a transfer, so only the kind check can refuse it.
+            ("another kind with a transfer's fields", json!([{"intent":"mt_withdraw","receiver_id":"d","tokens":{"t":"1"}}])),
+            ("no kind at all", json!([{"receiver_id":"d","tokens":{"t":"1"}}])),
+            ("a key beside a transfer", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"}},{"intent":"add_public_key","public_key":"ed25519:x"}])),
+            ("two transfers", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"}},{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"}}])),
+            ("no intents", json!([])),
+            ("a memo", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"},"memo":"x"}])),
+            ("an unread field", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"},"notification":{"msg":"x"}}])),
+            ("two tokens", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":"1","u":"1"}}])),
+            ("a numeric amount", json!([{"intent":"transfer","receiver_id":"d","tokens":{"t":1}}])),
+        ] {
+            assert!(parse_trusted_transfer(&transfer_msg(intents)).is_err(), "{why} would be signed");
+        }
+        for bad in ["not json", "{}", r#"{"intents":[]}"#, r#"{"signer_id":"me.near"}"#] {
+            assert!(parse_trusted_transfer(bad).is_err(), "{bad} would be signed");
+        }
+
+        // A key twice, at any depth: the LAST copy is the one a Value keeps, so each
+        // case puts the harmless copy last — a reader taking the first would execute
+        // the other one.
+        let t = r#"{"intent":"transfer","receiver_id":"d","tokens":{"t":"1"}}"#;
+        for (why, dup) in [
+            ("intents twice", format!(r#"{{"signer_id":"me.near","intents":[{{"intent":"add_public_key","public_key":"ed25519:x"}}],"intents":[{t}]}}"#)),
+            ("signer twice", format!(r#"{{"signer_id":"victim.near","signer_id":"me.near","intents":[{t}]}}"#)),
+            ("the kind twice", r#"{"signer_id":"me.near","intents":[{"intent":"add_public_key","intent":"transfer","receiver_id":"d","tokens":{"t":"1"}}]}"#.to_string()),
+            ("the receiver twice", r#"{"signer_id":"me.near","intents":[{"intent":"transfer","receiver_id":"thief","receiver_id":"d","tokens":{"t":"1"}}]}"#.to_string()),
+            ("the token twice", r#"{"signer_id":"me.near","intents":[{"intent":"transfer","receiver_id":"d","tokens":{"t":"999","t":"1"}}]}"#.to_string()),
+        ] {
+            match parse_trusted_transfer(&dup) {
+                Err(e) => assert!(e.contains("twice"), "{why}: {e}"),
+                Ok(t) => panic!("{why} would be signed as {t:?}"),
+            }
+        }
+        assert!(parse_trusted_transfer(&format!(r#"{{"signer_id":"me.near","intents":[{t}]}} trailing"#)).is_err());
+    }
+
+    /// The transfer is held to the op the policy and the approvers judged.
+    #[test]
+    fn a_trusted_transfer_fits_its_op() {
+        let t = |token: &str, amount: &str, signer: &str| TrustedTransfer {
+            signer_id: signer.into(), receiver_id: "dep".into(), token: token.into(), amount: amount.into(), deadline: None,
+        };
+        let swap = Op::Swap { token_in: "nep141:usdc.near".into(), amount_in: "100".into(), token_out: "nep141:wrap.near".into(), min_out: "1".into() };
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "100", "me"), &swap, "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "99", "me"), &swap, "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "101", "me"), &swap, "me").is_err(), "more than authorised");
+        assert!(trusted_transfer_fits_op(&t("nep141:btc.near", "100", "me"), &swap, "me").is_err(), "another token");
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "100", "them"), &swap, "me").is_err(), "another signer");
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "x", "me"), &swap, "me").is_err());
+
+        // Native NEAR leaves the intents balance as wNEAR.
+        let native = Op::CrossChainWithdraw { to: "0xabc".into(), amount: "5".into(), token: "native".into(), chain: "eth".into() };
+        assert!(trusted_transfer_fits_op(&t("nep141:wrap.near", "5", "me"), &native, "me").is_ok());
+
+        // Only Trusted ops are signed over an artifact.
+        let built = Op::Withdraw { to: "x".into(), amount: "5".into(), token: "nep141:usdc.near".into() };
+        assert!(trusted_transfer_fits_op(&t("nep141:usdc.near", "5", "me"), &built, "me").is_err());
     }
 
     /// The amount is the caller's contract's answer, so it is capped where it is read.
