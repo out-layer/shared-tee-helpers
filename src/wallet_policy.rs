@@ -154,8 +154,9 @@ pub fn is_fenced_intents_call(to: &str, method: &str) -> bool {
 // ([`trusted_transfer_fits_op`]): the wallet as signer, the op's token, no more
 // than the op's amount. The op's token has two names, the public balance's and
 // the confidential shard's (`imt:<Private Treasury>:<token>`,
-// [`confidential_token`]); a spend from the confidential balance carries the
-// second. The receiver is the one thing left to the caller: the
+// [`confidential_token`]), and the transfer carries the name of the balance
+// the op spends ([`spent_from`]): the confidential balance leaves only under an
+// op the `confidential` capability judged. The receiver is the one thing left to the caller: the
 // deposit address exists only after the quote. The coordinator holds the
 // receiver and the exact amount to 1Click's quote on top of this.
 //
@@ -308,16 +309,42 @@ pub fn confidential_token(token: &str) -> String {
     format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:{}", as_intents_token(token))
 }
 
+/// The balance a Trusted op may spend, and so the name its token may carry in the
+/// transfer: the public balance's, or the confidential one's ([`confidential_token`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpentFrom {
+    Public,
+    Confidential,
+    /// Either balance: an order paying out to the confidential balance may be
+    /// funded from the public one or from the confidential one.
+    Either,
+}
+
+/// Which balance `op` may spend. The confidential balance is spent only under an
+/// op the `confidential` capability judged: a confidential flow other than the
+/// shield (whose `flow` is `deposit`; the names are the coordinator's
+/// `ConfidentialOpKind::flow_name`), or a limit order paying out to the
+/// confidential balance. A flow not named here spends the public balance only.
+fn spent_from(op: &Op) -> SpentFrom {
+    match op {
+        Op::Confidential { flow, .. } => match flow.as_str() {
+            "unshield" | "withdraw" | "transfer" | "swap" => SpentFrom::Confidential,
+            _ => SpentFrom::Public,
+        },
+        Op::LimitOrder { to_type: RecipientType::ConfidentialIntents, .. } => SpentFrom::Either,
+        _ => SpentFrom::Public,
+    }
+}
+
 /// Whether a Trusted transfer is within the op it is signed under: `signer` (the
 /// wallet's own account) sends it, in the op's token, no more than the op's amount.
 ///
-/// The op's token is accepted in either of its two names: as the public balance
-/// holds it, or as the confidential balance does ([`confidential_token`]). Both
-/// are the same asset, bound by the same amount. Which balance an op spends is
-/// not on every op (a limit order funded from the confidential balance carries
-/// no marker), so it is not judged here: the coordinator, which knows the op's
-/// source, holds the transfer to the one exact name (`held_to_the_quote`,
-/// `fund_from_confidential`).
+/// The op's token is named as the balance the op spends holds it ([`spent_from`]):
+/// the public balance as itself, the confidential balance as its IMT token
+/// ([`confidential_token`]). So the confidential balance leaves only under an op
+/// the `confidential` capability judged, never under a swap, a cross-chain
+/// withdraw, a payment check or a shield. The coordinator holds the transfer to
+/// the one exact name on top (`held_to_the_quote`, `fund_from_confidential`).
 pub fn trusted_transfer_fits_op(t: &TrustedTransfer, op: &Op, signer: &str) -> Result<(), String> {
     if bind_mode(op) != BindMode::Trusted {
         return Err(format!("a {} op is not signed over an artifact", op.primary_type()));
@@ -325,12 +352,20 @@ pub fn trusted_transfer_fits_op(t: &TrustedTransfer, op: &Op, signer: &str) -> R
     if t.signer_id != signer {
         return Err(format!("the transfer's signer is {}, not this wallet", t.signer_id));
     }
-    if as_intents_token(&t.token) != as_intents_token(op.token()) && t.token != confidential_token(op.token()) {
+    let public = as_intents_token(&t.token) == as_intents_token(op.token());
+    let confidential = t.token == confidential_token(op.token());
+    let (fits, balance) = match spent_from(op) {
+        SpentFrom::Public => (public, "the public balance"),
+        SpentFrom::Confidential => (confidential, "the confidential balance"),
+        SpentFrom::Either => (public || confidential, "either balance"),
+    };
+    if !fits {
         return Err(format!(
-            "the transfer moves {}, the {} was authorised in {}",
+            "the transfer moves {}, the {} was authorised in {} from {}",
             t.token,
             op.primary_type(),
-            op.token()
+            op.token(),
+            balance
         ));
     }
     let moved: u128 = t.amount.parse().map_err(|_| format!("transfer amount '{}' is not an integer", t.amount))?;
@@ -3430,16 +3465,57 @@ mod tests {
         assert!(trusted_transfer_fits_op(&t(&other_token, "1", "me"), &unshield, "me").is_err(), "another token");
         assert!(trusted_transfer_fits_op(&t(&format!("{shard}:x"), "1", "me"), &unshield, "me").is_err(), "a longer name");
         assert!(trusted_transfer_fits_op(&t(&format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:"), "1", "me"), &unshield, "me").is_err());
-        // A limit order funded from the confidential balance carries no marker of it.
-        let order = Op::LimitOrder {
-            to: "me".into(), to_type: RecipientType::Intents, amount: "200000".into(), token: usdc.into(),
+        assert!(trusted_transfer_fits_op(&t(usdc, "100000", "me"), &unshield, "me").is_err(), "an unshield spends the confidential balance");
+        // Every confidential flow but the shield spends the confidential balance, and
+        // only its name; the shield (`deposit`) and an unknown flow the public one only.
+        let flow = |name: &str| Op::Confidential {
+            flow: name.into(), to: None, amount: "100000".into(), token: usdc.into(),
+            chain: None, token_out: None, min_amount_out: None,
+        };
+        for name in ["unshield", "withdraw", "transfer", "swap"] {
+            assert!(trusted_transfer_fits_op(&t(&shard, "100000", "me"), &flow(name), "me").is_ok(), "{name}");
+            assert!(trusted_transfer_fits_op(&t(usdc, "100000", "me"), &flow(name), "me").is_err(), "{name} from the public balance");
+        }
+        for name in ["deposit", "shield", "something-new"] {
+            assert!(trusted_transfer_fits_op(&t(usdc, "100000", "me"), &flow(name), "me").is_ok(), "{name}");
+            assert!(trusted_transfer_fits_op(&t(&shard, "100000", "me"), &flow(name), "me").is_err(), "{name} from the confidential balance");
+        }
+        // An op the `confidential` capability does not judge never spends the
+        // confidential balance: a swap, a cross-chain withdraw, a payment check.
+        let swap_usdc = Op::Swap { token_in: usdc.into(), amount_in: "100000".into(), token_out: "nep141:wrap.near".into(), min_out: "1".into() };
+        let bridge = Op::CrossChainWithdraw { to: "0xabc".into(), amount: "100000".into(), token: usdc.into(), chain: "base".into() };
+        let check = Op::PaymentCheck { amount: "100000".into(), token: usdc.into() };
+        for (why, op) in [("a swap", &swap_usdc), ("a cross-chain withdraw", &bridge), ("a payment check", &check)] {
+            assert!(trusted_transfer_fits_op(&t(usdc, "100000", "me"), op, "me").is_ok(), "{why}");
+            match trusted_transfer_fits_op(&t(&shard, "100000", "me"), op, "me") {
+                Err(e) => assert!(e.contains("from the public balance"), "{why}: {e}"),
+                Ok(()) => panic!("{why} would spend the confidential balance"),
+            }
+        }
+        // A limit order paying out to the confidential balance (which the capability
+        // judges) may be funded from either balance; any other order from the public one.
+        let order = |to_type: RecipientType| Op::LimitOrder {
+            to: "me".into(), to_type, amount: "200000".into(), token: usdc.into(),
             token_out: "nep141:wrap.near".into(), min_amount_out: "1".into(),
         };
-        assert!(trusted_transfer_fits_op(&t(&shard, "200000", "me"), &order, "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t(&shard, "200000", "me"), &order(RecipientType::ConfidentialIntents), "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t(usdc, "200000", "me"), &order(RecipientType::ConfidentialIntents), "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t(&shard, "200001", "me"), &order(RecipientType::ConfidentialIntents), "me").is_err());
+        for to_type in [RecipientType::Intents, RecipientType::DestinationChain] {
+            assert!(trusted_transfer_fits_op(&t(usdc, "200000", "me"), &order(to_type), "me").is_ok(), "{to_type:?}");
+            assert!(trusted_transfer_fits_op(&t(&shard, "200000", "me"), &order(to_type), "me").is_err(), "{to_type:?} from the confidential balance");
+        }
         // Native NEAR on the shard is wNEAR there too.
+        let native_out = Op::Confidential {
+            flow: "withdraw".into(), to: None, amount: "5".into(), token: "native".into(),
+            chain: None, token_out: None, min_amount_out: None,
+        };
+        assert!(trusted_transfer_fits_op(
+            &t(&format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:nep141:wrap.near"), "5", "me"), &native_out, "me"
+        ).is_ok());
         assert!(trusted_transfer_fits_op(
             &t(&format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:nep141:wrap.near"), "5", "me"), &native, "me"
-        ).is_ok());
+        ).is_err(), "a native cross-chain withdraw spends the public balance");
 
         // Only Trusted ops are signed over an artifact.
         let built = Op::Withdraw { to: "x".into(), amount: "5".into(), token: "nep141:usdc.near".into() };
