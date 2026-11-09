@@ -152,7 +152,10 @@ pub fn is_fenced_intents_call(to: &str, method: &str) -> bool {
 // only when its message is exactly that ([`parse_trusted_transfer`]) and the
 // transfer fits the op the policy and the approvers judged
 // ([`trusted_transfer_fits_op`]): the wallet as signer, the op's token, no more
-// than the op's amount. The receiver is the one thing left to the caller: the
+// than the op's amount. The op's token has two names, the public balance's and
+// the confidential shard's (`imt:<Private Treasury>:<token>`,
+// [`confidential_token`]); a spend from the confidential balance carries the
+// second. The receiver is the one thing left to the caller: the
 // deposit address exists only after the quote. The coordinator holds the
 // receiver and the exact amount to 1Click's quote on top of this.
 //
@@ -290,8 +293,31 @@ fn as_intents_token(token: &str) -> &str {
     }
 }
 
+/// The Private Treasury account of NEAR Intents' confidential chain (FAR). A
+/// confidential balance is held there as an IMT token whose id prefixes the public
+/// asset id with this account — `imt:<treasury>:nep141:<token>` — backed 1:1 by
+/// the tokens the Treasury locks on NEAR; a transfer out of the confidential
+/// balance names the asset so. Defuse documents the account
+/// (`PRIVATE_TREASURY_ACCOUNT_ID`) as a production constant shared by every
+/// participant, the same for every token.
+pub const PRIVATE_TREASURY_ACCOUNT_ID: &str = "51e8f94d77b5e90dc9852ca6113771e11e8382ce69473a75e313e41665de7cbe";
+
+/// `token` as the confidential shard names it: what a transfer out of the
+/// confidential balance moves when an op is authorised in `token`.
+pub fn confidential_token(token: &str) -> String {
+    format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:{}", as_intents_token(token))
+}
+
 /// Whether a Trusted transfer is within the op it is signed under: `signer` (the
 /// wallet's own account) sends it, in the op's token, no more than the op's amount.
+///
+/// The op's token is accepted in either of its two names: as the public balance
+/// holds it, or as the confidential balance does ([`confidential_token`]). Both
+/// are the same asset, bound by the same amount. Which balance an op spends is
+/// not on every op (a limit order funded from the confidential balance carries
+/// no marker), so it is not judged here: the coordinator, which knows the op's
+/// source, holds the transfer to the one exact name (`held_to_the_quote`,
+/// `fund_from_confidential`).
 pub fn trusted_transfer_fits_op(t: &TrustedTransfer, op: &Op, signer: &str) -> Result<(), String> {
     if bind_mode(op) != BindMode::Trusted {
         return Err(format!("a {} op is not signed over an artifact", op.primary_type()));
@@ -299,7 +325,7 @@ pub fn trusted_transfer_fits_op(t: &TrustedTransfer, op: &Op, signer: &str) -> R
     if t.signer_id != signer {
         return Err(format!("the transfer's signer is {}, not this wallet", t.signer_id));
     }
-    if as_intents_token(&t.token) != as_intents_token(op.token()) {
+    if as_intents_token(&t.token) != as_intents_token(op.token()) && t.token != confidential_token(op.token()) {
         return Err(format!(
             "the transfer moves {}, the {} was authorised in {}",
             t.token,
@@ -3386,6 +3412,34 @@ mod tests {
         // Native NEAR leaves the intents balance as wNEAR.
         let native = Op::CrossChainWithdraw { to: "0xabc".into(), amount: "5".into(), token: "native".into(), chain: "eth".into() };
         assert!(trusted_transfer_fits_op(&t("nep141:wrap.near", "5", "me"), &native, "me").is_ok());
+
+        // The confidential balance names the same asset under the Private Treasury,
+        // as in the unshield 1Click generated on mainnet; the amount bound is the same.
+        let usdc = "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
+        let shard = format!("imt:51e8f94d77b5e90dc9852ca6113771e11e8382ce69473a75e313e41665de7cbe:{usdc}");
+        assert_eq!(confidential_token(usdc), shard);
+        let unshield = Op::Confidential {
+            flow: "unshield".into(), to: None, amount: "100000".into(), token: usdc.into(),
+            chain: None, token_out: None, min_amount_out: None,
+        };
+        assert!(trusted_transfer_fits_op(&t(&shard, "100000", "me"), &unshield, "me").is_ok());
+        assert!(trusted_transfer_fits_op(&t(&shard, "100001", "me"), &unshield, "me").is_err(), "more than authorised");
+        let other_treasury = shard.replace("51e8f94d", "00000000");
+        assert!(trusted_transfer_fits_op(&t(&other_treasury, "1", "me"), &unshield, "me").is_err(), "another treasury");
+        let other_token = format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:nep141:btc.near");
+        assert!(trusted_transfer_fits_op(&t(&other_token, "1", "me"), &unshield, "me").is_err(), "another token");
+        assert!(trusted_transfer_fits_op(&t(&format!("{shard}:x"), "1", "me"), &unshield, "me").is_err(), "a longer name");
+        assert!(trusted_transfer_fits_op(&t(&format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:"), "1", "me"), &unshield, "me").is_err());
+        // A limit order funded from the confidential balance carries no marker of it.
+        let order = Op::LimitOrder {
+            to: "me".into(), to_type: RecipientType::Intents, amount: "200000".into(), token: usdc.into(),
+            token_out: "nep141:wrap.near".into(), min_amount_out: "1".into(),
+        };
+        assert!(trusted_transfer_fits_op(&t(&shard, "200000", "me"), &order, "me").is_ok());
+        // Native NEAR on the shard is wNEAR there too.
+        assert!(trusted_transfer_fits_op(
+            &t(&format!("imt:{PRIVATE_TREASURY_ACCOUNT_ID}:nep141:wrap.near"), "5", "me"), &native, "me"
+        ).is_ok());
 
         // Only Trusted ops are signed over an artifact.
         let built = Op::Withdraw { to: "x".into(), amount: "5".into(), token: "nep141:usdc.near".into() };
