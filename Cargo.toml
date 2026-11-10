@@ -14,7 +14,7 @@ rand = "0.8"
 bs58 = "0.5"
 
 # HTTP client (for NEAR RPC view_access_key)
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
