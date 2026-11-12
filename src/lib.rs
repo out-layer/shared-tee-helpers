@@ -144,11 +144,58 @@ pub fn is_implicit_account(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Length of a TEE session challenge in bytes.
+pub const CHALLENGE_LEN: usize = 32;
+
+/// Prefix of the message a worker signs to open a TEE session.
+///
+/// The worker's TEE key also signs its NEAR transactions, and a NEAR transaction signature is a
+/// signature over a 32-byte sha256. A bare 32-byte challenge is therefore indistinguishable from
+/// a transaction hash: whoever hands the worker a challenge — the server, or whatever terminates
+/// TLS in front of it — could hand it a transaction hash and get back a valid transaction signed
+/// by the attested key. A message that starts with this prefix is never a transaction hash.
+pub const TEE_SESSION_DOMAIN: &[u8] = b"outlayer-tee-session-v1:";
+
 /// Generate a random 32-byte challenge as hex string (64 chars).
 pub fn generate_challenge() -> String {
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; CHALLENGE_LEN];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// The message a worker signs for a challenge: [`TEE_SESSION_DOMAIN`], then the challenge bytes.
+pub fn session_message(challenge_bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(TEE_SESSION_DOMAIN.len() + challenge_bytes.len());
+    message.extend_from_slice(TEE_SESSION_DOMAIN);
+    message.extend_from_slice(challenge_bytes);
+    message
+}
+
+/// Decode a hex challenge, refusing anything but exactly [`CHALLENGE_LEN`] bytes.
+fn decode_challenge(challenge: &str) -> Result<Vec<u8>, TeeAuthError> {
+    let bytes = hex::decode(challenge)
+        .map_err(|e| TeeAuthError::InvalidChallenge(format!("hex decode error: {}", e)))?;
+    if bytes.len() != CHALLENGE_LEN {
+        return Err(TeeAuthError::InvalidChallenge(format!(
+            "{} bytes, expected {}",
+            bytes.len(),
+            CHALLENGE_LEN
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Sign a server's TEE session challenge: the worker's only way to sign one.
+///
+/// Signs [`session_message`] of the challenge, never the challenge itself (see
+/// [`TEE_SESSION_DOMAIN`]), and refuses a challenge that is not hex of exactly
+/// [`CHALLENGE_LEN`] bytes.
+pub fn sign_session_challenge(
+    secret_key: &near_crypto::SecretKey,
+    challenge: &str,
+) -> Result<Signature, TeeAuthError> {
+    let challenge_bytes = decode_challenge(challenge)?;
+    Ok(secret_key.sign(&session_message(&challenge_bytes)))
 }
 
 /// Verify a challenge signature in NEAR canonical form, gated by an allowlist.
@@ -156,6 +203,11 @@ pub fn generate_challenge() -> String {
 /// Handles ed25519 and ml-dsa-65 (FIPS-204) uniformly via near-crypto. The key type is taken
 /// from the `public_key`/`signature` strings themselves (their scheme prefix), then checked
 /// against `allowed` — so the server, not the worker, decides which schemes are acceptable.
+///
+/// The signature is accepted over [`session_message`] of the challenge, or over the bare
+/// challenge from a worker that signs it bare. Accepting the bare form exposes nothing on the
+/// server: the challenge is fresh and random, so no signature made elsewhere matches it. The
+/// danger of a bare signature is on the signer's side, which [`sign_session_challenge`] closes.
 ///
 /// # Arguments
 /// * `public_key` - NEAR canonical form, e.g. `ed25519:<base58>` or `ml-dsa-65:<base58>`
@@ -180,11 +232,9 @@ pub fn verify_signature(
     let sig = Signature::from_str(signature)
         .map_err(|e| TeeAuthError::InvalidSignature(format!("parse error: {}", e)))?;
 
-    // Verify the raw challenge bytes (not the hex string).
-    let challenge_bytes = hex::decode(challenge)
-        .map_err(|e| TeeAuthError::InvalidChallenge(format!("hex decode error: {}", e)))?;
+    let challenge_bytes = decode_challenge(challenge)?;
 
-    if sig.verify(&challenge_bytes, &pk) {
+    if sig.verify(&session_message(&challenge_bytes), &pk) || sig.verify(&challenge_bytes, &pk) {
         Ok(())
     } else {
         Err(TeeAuthError::SignatureVerificationFailed)
@@ -240,7 +290,7 @@ pub async fn check_access_key_on_contract(
     let json: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| TeeAuthError::NearRpcError(format!("response parse failed: {}", e)))?;
+        .map_err(|e| TeeAuthError::NearRpcError(format!("response parse failed: {}", e.without_url())))?;
 
     // If there's an error field, the key doesn't exist
     if let Some(error) = json.get("error") {
@@ -379,9 +429,47 @@ mod tests {
 
     fn sign_ok(sk: &SecretKey) {
         let challenge = generate_challenge();
-        let challenge_bytes = hex::decode(&challenge).unwrap();
-        let sig = sk.sign(&challenge_bytes);
+        let sig = sign_session_challenge(sk, &challenge).unwrap();
         verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH).unwrap();
+    }
+
+    #[test]
+    fn a_session_signature_is_over_the_prefixed_challenge_never_the_bare_one() {
+        for kt in [KeyType::ED25519, KeyType::MLDSA65] {
+            let sk = SecretKey::from_random(kt);
+            let challenge = generate_challenge();
+            let bytes = hex::decode(&challenge).unwrap();
+            let sig = sign_session_challenge(&sk, &challenge).unwrap();
+            assert!(sig.verify(&session_message(&bytes), &sk.public_key()));
+            assert!(!sig.verify(&bytes, &sk.public_key()), "{kt:?}: the bare challenge must not verify");
+        }
+    }
+
+    #[test]
+    fn a_challenge_of_any_other_length_is_not_signed() {
+        let sk = SecretKey::from_random(KeyType::ED25519);
+        for bad in ["", "00", &"00".repeat(31), &"00".repeat(33), &"00".repeat(64), "zz"] {
+            let err = sign_session_challenge(&sk, bad).unwrap_err();
+            assert!(matches!(err, TeeAuthError::InvalidChallenge(_)), "{bad:?}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_bare_challenge_signature_is_still_accepted() {
+        let sk = SecretKey::from_random(KeyType::ED25519);
+        let challenge = generate_challenge();
+        let sig = sk.sign(&hex::decode(&challenge).unwrap());
+        verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH).unwrap();
+    }
+
+    #[test]
+    fn a_challenge_of_another_length_is_not_verified() {
+        let sk = SecretKey::from_random(KeyType::ED25519);
+        let challenge = "00".repeat(33);
+        let sig = sk.sign(&hex::decode(&challenge).unwrap());
+        let err = verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH)
+            .unwrap_err();
+        assert!(matches!(err, TeeAuthError::InvalidChallenge(_)), "got {err:?}");
     }
 
     #[test]
