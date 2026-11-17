@@ -7,7 +7,7 @@
 //! 1. Server generates random challenge via `generate_challenge()`
 //! 2. Worker signs challenge with TEE private key
 //! 3. Server verifies signature via `verify_signature()`
-//! 4. Server checks key exists on register-contract via `check_access_key_on_contract()`
+//! 4. Server checks the key is a function-call key on the register contract via `check_access_key_on_contract()`
 
 use near_crypto::{KeyType, PublicKey, Signature};
 use rand::RngCore;
@@ -229,15 +229,36 @@ pub fn verify_signature(
         return Err(TeeAuthError::KeyTypeNotAllowed(format!("{}", pk.key_type())));
     }
 
+    // An ed25519 key of small order has no secret key, and near-crypto's cofactorless check
+    // accepts signatures for it that need none: never a session's key, whatever account holds it.
+    if let PublicKey::ED25519(k) = &pk {
+        if ed25519_dalek::VerifyingKey::from_bytes(&k.0).map(|v| v.is_weak()).unwrap_or(false) {
+            return Err(TeeAuthError::InvalidPublicKey("an ed25519 key of small order".into()));
+        }
+    }
+
     let sig = Signature::from_str(signature)
         .map_err(|e| TeeAuthError::InvalidSignature(format!("parse error: {}", e)))?;
 
     let challenge_bytes = decode_challenge(challenge)?;
 
-    if sig.verify(&session_message(&challenge_bytes), &pk) || sig.verify(&challenge_bytes, &pk) {
+    if verify_strict(&sig, &session_message(&challenge_bytes), &pk) || verify_strict(&sig, &challenge_bytes, &pk) {
         Ok(())
     } else {
         Err(TeeAuthError::SignatureVerificationFailed)
+    }
+}
+
+/// `sig` over `data` by `pk`, with ed25519 checked strictly (`verify_strict`: no key of small
+/// order, no non-canonical R or s) — near-crypto's own ed25519 check is cofactorless and takes
+/// both. ML-DSA-65 and secp256k1 go through near-crypto.
+pub fn verify_strict(sig: &Signature, data: &[u8], pk: &PublicKey) -> bool {
+    match (sig, pk) {
+        (Signature::ED25519(sig), PublicKey::ED25519(pk)) => ed25519_dalek::VerifyingKey::from_bytes(&pk.0)
+            .map(|vk| vk.verify_strict(data, sig).is_ok())
+            .unwrap_or(false),
+        (Signature::ED25519(_), _) | (_, PublicKey::ED25519(_)) => false,
+        _ => sig.verify(data, pk),
     }
 }
 
@@ -292,38 +313,46 @@ pub async fn check_access_key_on_contract(
         .await
         .map_err(|e| TeeAuthError::NearRpcError(format!("response parse failed: {}", e.without_url())))?;
 
-    // If there's an error field, the key doesn't exist
+    access_key_answer(&json)
+}
+
+/// What a `view_access_key` answer says. `Ok(false)` only when the RPC says the key is not on the
+/// account (`UNKNOWN_ACCESS_KEY`, or the "does not exist" of older RPC versions) or names a key
+/// that admits no session; every other answer — a rate limit, an outage, a body without a
+/// result — is an error, so a caller that ends sessions on `Ok(false)` never ends them on an RPC
+/// that did not answer.
+fn access_key_answer(json: &serde_json::Value) -> Result<bool, TeeAuthError> {
+    // The key's own absence, never the account's: an UNKNOWN_ACCOUNT ("account … does not
+    // exist") is a wrong operator account, not a key taken off it.
+    let says_missing = |text: &str| {
+        text.contains("access key") && (text.contains("does not exist") || text.contains("doesn't exist"))
+    };
     if let Some(error) = json.get("error") {
-        // Check structured error first: error.cause.name == "UNKNOWN_ACCESS_KEY"
-        let is_unknown_key = error
+        let unknown_key = error
             .get("cause")
             .and_then(|c| c.get("name"))
             .and_then(|n| n.as_str())
-            .map(|name| name == "UNKNOWN_ACCESS_KEY")
-            .unwrap_or(false);
-
-        if is_unknown_key {
+            == Some("UNKNOWN_ACCESS_KEY");
+        if unknown_key || says_missing(error.get("data").and_then(|d| d.as_str()).unwrap_or("")) {
             return Ok(false);
         }
-
-        // Fallback: check error.data string for older RPC versions
-        let error_data = error
-            .get("data")
-            .and_then(|d| d.as_str())
-            .unwrap_or("");
-        if error_data.contains("does not exist") || error_data.contains("doesn't exist") {
-            return Ok(false);
-        }
-
         return Err(TeeAuthError::NearRpcError(format!("RPC error: {}", error)));
     }
-
-    // Check that result exists and has permission field (valid access key)
-    if json.get("result").and_then(|r| r.get("permission")).is_some() {
-        Ok(true)
-    } else {
-        Ok(false)
+    match json.get("result") {
+        Some(result) if result.get("permission").is_some() => Ok(admits_session(result)),
+        Some(result) => match result.get("error").and_then(|e| e.as_str()) {
+            Some(text) if says_missing(text) => Ok(false),
+            _ => Err(TeeAuthError::NearRpcError("RPC answer names no access key".into())),
+        },
+        None => Err(TeeAuthError::NearRpcError("RPC answer has neither a result nor an error".into())),
     }
+}
+
+/// A `view_access_key` result that admits a session: a function-call key only. The keys a
+/// register contract adds for an attested TEE are function-call keys; a full-access key on the
+/// account is the operator's, never a TEE's.
+fn admits_session(result: &serde_json::Value) -> bool {
+    result.get("permission").and_then(|p| p.get("FunctionCall")).is_some()
 }
 
 /// Check if a public key exists on a NEAR account, with retry for finality lag.
@@ -431,6 +460,77 @@ mod tests {
         let challenge = generate_challenge();
         let sig = sign_session_challenge(sk, &challenge).unwrap();
         verify_signature(&sk.public_key().to_string(), &challenge, &sig.to_string(), BOTH).unwrap();
+    }
+
+    #[test]
+    fn only_an_explicit_not_found_reads_as_no_key() {
+        use serde_json::json;
+        let fc = json!({"result": {"nonce": 1, "permission": {"FunctionCall": {"allowance": null, "receiver_id": "o.near", "method_names": []}}}});
+        assert!(access_key_answer(&fc).unwrap());
+        assert!(!access_key_answer(&json!({"result": {"nonce": 1, "permission": "FullAccess"}})).unwrap());
+        assert!(!access_key_answer(&json!({"error": {"cause": {"name": "UNKNOWN_ACCESS_KEY"}}})).unwrap());
+        assert!(!access_key_answer(&json!({"error": {"data": "access key ed25519:x does not exist while viewing"}})).unwrap());
+        assert!(!access_key_answer(&json!({"result": {"error": "access key ed25519:x does not exist while viewing"}})).unwrap());
+        // A rate limit, an outage, a body that names nothing: errors, never "no key".
+        for answer in [
+            json!({"error": {"code": 429, "message": "Too Many Requests"}}),
+            json!({"error": {"cause": {"name": "TIMEOUT_ERROR"}}}),
+            json!({"message": "service unavailable"}),
+            json!({"result": {"error": "the node is syncing"}}),
+            json!({"error": {"cause": {"name": "UNKNOWN_ACCOUNT"}, "data": "account worker.x does not exist while viewing"}}),
+            json!({}),
+        ] {
+            assert!(access_key_answer(&answer).is_err(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn only_a_function_call_key_admits_a_session() {
+        let fc = serde_json::json!({"nonce": 1, "permission": {"FunctionCall": {"allowance": null, "receiver_id": "outlayer.near", "method_names": []}}});
+        assert!(admits_session(&fc));
+        assert!(!admits_session(&serde_json::json!({"nonce": 1, "permission": "FullAccess"})));
+        assert!(!admits_session(&serde_json::json!({"nonce": 1})));
+    }
+
+    #[test]
+    fn verify_strict_takes_honest_signatures_of_every_scheme() {
+        for kt in [KeyType::ED25519, KeyType::MLDSA65] {
+            let sk = SecretKey::from_random(kt);
+            let sig = sk.sign(b"m");
+            assert!(verify_strict(&sig, b"m", &sk.public_key()), "{kt:?}");
+            assert!(!verify_strict(&sig, b"n", &sk.public_key()), "{kt:?}");
+        }
+        let ed = SecretKey::from_random(KeyType::ED25519);
+        let ml = SecretKey::from_random(KeyType::MLDSA65);
+        assert!(!verify_strict(&ed.sign(b"m"), b"m", &ml.public_key()));
+        assert!(!verify_strict(&ml.sign(b"m"), b"m", &ed.public_key()));
+    }
+
+    #[test]
+    fn a_key_of_small_order_is_refused_before_any_signature_is_checked() {
+        let challenge = generate_challenge();
+        let sig = format!("ed25519:{}", bs58::encode([0u8; 64]).into_string());
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let mut order8 = [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98,
+            0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53,
+            0xfc, 0x05,
+        ];
+        order8[31] |= 0x80;
+        for b in [[0u8; 32], one, order8] {
+            let pk = format!("ed25519:{}", bs58::encode(b).into_string());
+            match verify_signature(&pk, &challenge, &sig, BOTH) {
+                Err(TeeAuthError::InvalidPublicKey(m)) => assert!(m.contains("small order"), "{m}"),
+                other => panic!("{b:02x?}: {other:?}"),
+            }
+        }
+        // A real key is not refused for its key: an unrelated signature fails verification.
+        let real = SecretKey::from_random(KeyType::ED25519).public_key().to_string();
+        assert!(matches!(
+            verify_signature(&real, &challenge, &sig, BOTH),
+            Err(TeeAuthError::SignatureVerificationFailed)
+        ));
     }
 
     #[test]

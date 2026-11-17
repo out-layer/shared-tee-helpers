@@ -2135,6 +2135,7 @@ dependencies = [
  "bs58 0.5.1",
  "defuse-near-promise",
  "defuse-wallet",
+ "ed25519-dalek",
  "hex",
  "near-crypto",
  "rand",

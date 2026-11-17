@@ -8,6 +8,8 @@ license = "Apache-2.0"
 # Crypto — near-crypto verifies ed25519, secp256k1 and ml-dsa-65 (FIPS-204 post-quantum)
 # signatures uniformly, using the same aws-lc-rs ML-DSA backend nearcore signs with.
 near-crypto = "0.37"
+# A key of small order is refused before near-crypto verifies (its ed25519 check is cofactorless).
+ed25519-dalek = { version = "2", default-features = false }
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
