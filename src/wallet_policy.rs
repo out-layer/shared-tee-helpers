@@ -726,19 +726,22 @@ pub fn lock_is_satisfiable(policy: &Policy) -> Result<(), String> {
                 .to_string(),
         );
     }
+    quorum_is_reachable(approval, "approval.locked", "this lock could never be lifted")
+}
+
+/// Whether the approval block names a quorum somebody can meet: a threshold of
+/// at least one, and at least that many DISTINCT approvers with an `id` (votes
+/// are counted per account, so a repeated entry is one voter). `rule` is the
+/// policy field that needs it and `unmet` what follows when it cannot be met,
+/// for the refusal.
+fn quorum_is_reachable(approval: &Approval, rule: &str, unmet: &str) -> Result<(), String> {
     let threshold = approval
         .threshold
         .as_ref()
-        .ok_or_else(|| {
-            "approval.locked needs approval.threshold: a locked policy is changed only with its \
-             approvers' quorum, and there is no quorum without a threshold"
-                .to_string()
-        })?
+        .ok_or_else(|| format!("{rule} needs approval.threshold: there is no quorum without a threshold"))?
         .required();
     if threshold < 1 {
-        return Err(format!(
-            "approval.locked needs approval.threshold of at least 1, got {threshold}"
-        ));
+        return Err(format!("{rule} needs approval.threshold of at least 1, got {threshold}"));
     }
     let named = approval
         .approvers
@@ -751,17 +754,74 @@ pub fn lock_is_satisfiable(policy: &Policy) -> Result<(), String> {
         })
         .unwrap_or(0);
     if named == 0 {
-        return Err(
-            "approval.locked needs approval.approvers with an id each: a locked policy is changed \
-             only with their quorum, and nobody could lift this one"
-                .to_string(),
-        );
+        return Err(format!(
+            "{rule} needs approval.approvers with an id each: {unmet}"
+        ));
     }
     if (threshold as usize) > named {
         return Err(format!(
-            "approval.locked needs a reachable quorum: threshold {threshold} but only {named} \
-             distinct approver(s) with an id — this lock could never be lifted"
+            "{rule} needs a reachable quorum: threshold {threshold} but only {named} distinct \
+             approver(s) with an id — {unmet}"
         ));
+    }
+    Ok(())
+}
+
+/// Whether a policy may be stored: the lock and the approval rules a write is
+/// refused for. Called wherever a policy is written — the coordinator's
+/// `encrypt-policy` and `sign-policy`, and the keystore's `sign-policy`. A
+/// limit that is not a whole number is not refused here: it refuses every
+/// operation it applies to when evaluated ([`unreadable_limit`]).
+///
+/// * a lock somebody can lift and nobody can step around
+///   ([`lock_is_satisfiable`]);
+/// * `approval.auto_up_to`: every entry of every window a whole number of the
+///   token's smallest unit, and no `*` — evaluated, such an entry only ever
+///   waits, so it is refused here where the owner can still see it;
+/// * `rules.addresses.unlisted`: `refuse` or `ask`, and `ask` only under a
+///   whitelist with a quorum to ask.
+pub fn policy_is_storable(policy: &Policy) -> Result<(), String> {
+    lock_is_satisfiable(policy)?;
+
+    if let Some(up_to) = policy.approval.as_ref().and_then(|a| a.auto_up_to.as_ref()) {
+        for (window, entries) in up_to.windows() {
+            for (token, max) in entries.into_iter().flatten() {
+                if token == "*" {
+                    return Err(format!(
+                        "approval.auto_up_to.{window} has no '*': one number is different money in \
+                         different tokens. Name each token"
+                    ));
+                }
+                if !max.bytes().all(|b| b.is_ascii_digit()) || max.parse::<u128>().is_err() {
+                    return Err(format!(
+                        "approval.auto_up_to.{window} for {token} is not a whole number in the token's \
+                         smallest unit (yoctoNEAR for native — 0.2 NEAR is '200000000000000000000000')"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(addresses) = policy.rules.as_ref().and_then(|r| r.addresses.as_ref()) {
+        match addresses.unlisted.as_deref() {
+            None | Some("refuse") => {}
+            Some("ask") => {
+                if addresses.mode.as_deref().unwrap_or("whitelist") != "whitelist" {
+                    return Err(
+                        "addresses.unlisted 'ask' is a rule of a whitelist: set addresses.mode to \
+                         whitelist, or drop it"
+                            .to_string(),
+                    );
+                }
+                let approval = policy.approval.as_ref().ok_or_else(|| {
+                    "addresses.unlisted 'ask' needs an approval block: there is nobody to ask".to_string()
+                })?;
+                quorum_is_reachable(approval, "addresses.unlisted 'ask'", "a new address could never be approved")?;
+            }
+            Some(other) => {
+                return Err(format!("addresses.unlisted '{other}' is not one of refuse, ask"));
+            }
+        }
     }
     Ok(())
 }
@@ -1094,6 +1154,54 @@ impl Op {
         }
     }
 
+    /// Whether `approval.auto_up_to` can let this op run without the approvers:
+    /// the kinds the keystore builds itself, whose amount is the whole of what
+    /// leaves and is charged to the spend windows the rule reads — a native
+    /// transfer, a withdrawal, an intents transfer.
+    ///
+    /// Every other kind waits whatever the window says. A `call`'s amount is the
+    /// attached deposit (an `ft_transfer` of any size attaches one yoctoNEAR); a
+    /// `delete` moves the whole balance and carries no amount; a storage deposit
+    /// is not a payment. The Trusted kinds (swap, confidential, cross-chain
+    /// withdrawal, limit order, payment check) are signed from an artifact the
+    /// coordinator supplies, and a payment check is charged to no window at
+    /// all, so no total bounds it.
+    pub fn runs_inside_auto_window(&self) -> bool {
+        match self {
+            Op::Transfer { .. } | Op::Withdraw { .. } | Op::IntentsTransfer { .. } => true,
+            Op::Call { .. }
+            | Op::Delete { .. }
+            | Op::IntentsStorageDeposit { .. }
+            | Op::Swap { .. }
+            | Op::Confidential { .. }
+            | Op::CrossChainWithdraw { .. }
+            | Op::LimitOrder { .. }
+            | Op::PaymentCheck { .. }
+            | Op::Raw { .. }
+            | Op::SignMessage { .. }
+            | Op::Auth { .. }
+            | Op::PolicyUpdate { .. } => false,
+        }
+    }
+
+    /// Whether `addresses.unlisted: "ask"` may put this op in front of the
+    /// approvers when its destination is off the whitelist: only a payment,
+    /// where the destination is who receives the amount the approver reads — a
+    /// native transfer, a withdrawal, an intents transfer, a cross-chain
+    /// withdrawal.
+    ///
+    /// Everything else off the list is refused, asking or not. A `call` moves
+    /// what its arguments say, not what its `to` says; a `delete` hands over the
+    /// whole balance; a limit order pays out later with no further signature. A
+    /// holder of the wallet's key must not be able to put those in front of the
+    /// owner as a question.
+    pub fn may_ask_about_destination(&self) -> bool {
+        matches!(
+            self,
+            Op::Transfer { .. } | Op::Withdraw { .. } | Op::IntentsTransfer { .. } | Op::CrossChainWithdraw { .. }
+        )
+    }
+
     /// Destination address subject to the whitelist/blacklist, if any.
     pub fn destination(&self) -> Option<&str> {
         match self {
@@ -1208,6 +1316,21 @@ pub struct Addresses {
     pub mode: Option<String>,
     #[serde(default)]
     pub list: Vec<String>,
+    /// What a whitelist does with a destination it does not list: `"refuse"`
+    /// (and absent) refuses it, `"ask"` makes the operation wait for the
+    /// approvers, who sign over the exact address (it is in the request hash).
+    /// Any other value refuses the operation, like an unreadable `mode`.
+    ///
+    /// Read under `whitelist` only, and only for a payment
+    /// ([`Op::may_ask_about_destination`]): a call, a delete, a limit order, a
+    /// storage deposit or a confidential flow aimed off the list is refused as
+    /// before, and so are the accounts inside a `w_execute_extension` request.
+    /// An asked address always waits — `approval.auto_up_to` and
+    /// `approval.excluded_types` do not let it through — and without an
+    /// approval threshold it is refused ([`policy_is_storable`] keeps such a
+    /// policy from being stored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlisted: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1264,6 +1387,46 @@ pub struct Approval {
     /// expire too fast to wait for multisig).
     #[serde(default)]
     pub excluded_types: Option<Vec<String>>,
+    /// How much of a token may leave in a window without the approvers
+    /// ([`AutoUpTo`]). Absent: every operation the trigger holds waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_up_to: Option<AutoUpTo>,
+}
+
+/// `approval.auto_up_to`: per window and token, the total (raw units) that may
+/// leave without the approvers. An operation the generic trigger would hold
+/// does not wait while, in every window that names its token, what the wallet
+/// already spent there plus this amount stays at most the entry.
+///
+/// The windows and their counters are the limits' own (`rules.limits`): the
+/// clock hour, the UTC day, the calendar month, counting everything the wallet
+/// spent in the token — approved or not. So an amount above the entry waits by
+/// itself, and so does the payment that would take the day's total over it.
+///
+/// It waits whenever the rule cannot be shown to hold: a token no window
+/// names (there is no `*` — one number is different money in different
+/// tokens), an entry that is not a whole number, counters that were not
+/// supplied or could not be read. It never reads as "no threshold".
+///
+/// Applies only to a native transfer, a withdrawal and an intents transfer
+/// ([`Op::runs_inside_auto_window`]); every other kind waits, and an address
+/// the whitelist asks about is not lifted by it. The limits are
+/// checked first and still hold: above a limit is a refusal, with or without
+/// approvers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoUpTo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hourly: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<BTreeMap<String, String>>,
+}
+
+impl AutoUpTo {
+    fn windows(&self) -> [(&'static str, Option<&BTreeMap<String, String>>); 3] {
+        [("hourly", self.hourly.as_ref()), ("daily", self.daily.as_ref()), ("monthly", self.monthly.as_ref())]
+    }
 }
 
 /// Either a bare number (plan §2.3 `"threshold": N`) or an object
@@ -1399,8 +1562,8 @@ pub struct Capability {
 // Usage (stateful state supplied by the coordinator)
 // ---------------------------------------------------------------------------
 
-/// Cumulative per-token spend + tx count, read from the coordinator DB. A token is
-/// present here only if the policy configures a limit for it (no limit → not tracked).
+/// Cumulative per-token spend + tx count, read from the coordinator DB: every token
+/// the wallet was charged for in the window, whether or not the policy limits it.
 /// All amounts are raw units.
 ///
 /// NOTE: the engine is stateless — it compares against whatever `Usage` the caller
@@ -1602,9 +1765,7 @@ fn evaluate_section(
     // means "no cap for this token" — so `{"daily":{"native":"0.2"}}`, the
     // shape an owner reaches for first, silently disarms the wallet instead of
     // capping it at 0.2 NEAR. Nothing on the write path rejects it either:
-    // the coordinator's `encrypt_policy` hands the JSON to the keystore as
-    // given, and its `sign_policy` only forwards a blob for signing; neither
-    // looks at a limit string.
+    // [`policy_is_storable`] does not read a limit string.
     //
     // Checked over the WHOLE limits block rather than at each lookup, so an
     // entry for a token this call does not touch is still caught — the owner
@@ -1682,18 +1843,30 @@ fn evaluate_section(
         }
     }
 
-    // 5. address whitelist/blacklist (STATELESS).
+    // 5. address whitelist/blacklist (STATELESS). A destination the whitelist is
+    //    told to ask about is not decided here: every rule below still applies to
+    //    it, and what survives them waits for the approvers (step 9a).
+    let mut asked_address: Option<&str> = None;
     if let (Some(addresses), Some(dest)) = (rules.and_then(|r| r.addresses.as_ref()), op.destination()) {
         if !dest.is_empty() {
             match address_mode(addresses) {
                 Err(unreadable) => return unreadable,
                 Ok(AddressMode::Whitelist) => {
+                    let unlisted = match unlisted_rule(addresses) {
+                        Ok(rule) => rule,
+                        Err(unreadable) => return unreadable,
+                    };
                     if !addresses.list.iter().any(|a| same_address(a, dest)) {
-                        return deny(format!(
-                            "Address '{}' is not in whitelist{}",
-                            dest,
-                            door_note(op)
-                        ));
+                        match unlisted {
+                            Unlisted::Ask if op.may_ask_about_destination() => asked_address = Some(dest),
+                            Unlisted::Refuse | Unlisted::Ask => {
+                                return deny(format!(
+                                    "Address '{}' is not in whitelist{}",
+                                    dest,
+                                    door_note(op)
+                                ));
+                            }
+                        }
                     }
                 }
                 // No door note here, deliberately: an owner who blacklisted an
@@ -1832,6 +2005,20 @@ fn evaluate_section(
         return decision;
     }
 
+    // 9a. An address the whitelist asks about (step 5) waits for the approvers,
+    //     whatever the op's type and amount: `excluded_types` and `auto_up_to`
+    //     describe payments to addresses the owner already listed.
+    if let Some(dest) = asked_address {
+        return match approval.and_then(|a| a.threshold.as_ref()) {
+            Some(threshold) => Decision::RequiresApproval { threshold: threshold.required() },
+            None => deny(format!(
+                "Address '{dest}' is not in whitelist, and the policy asks its approvers about a \
+                 new address but has no approval threshold{}",
+                door_note(op)
+            )),
+        };
+    }
+
     // 10. generic multisig trigger (STATELESS) for fund-moving kinds.
     if op.triggers_generic_approval() {
         if let Some(approval) = approval {
@@ -1844,7 +2031,7 @@ fn evaluate_section(
                         .any(|alias| ex.iter().any(|t| t == alias))
                 })
                 .unwrap_or(false);
-            if !excluded {
+            if !excluded && !runs_without_approvers(approval, op, amount, usage) {
                 if let Some(threshold) = approval.threshold.as_ref() {
                     return Decision::RequiresApproval {
                         threshold: threshold.required(),
@@ -2107,6 +2294,64 @@ fn address_mode(addresses: &Addresses) -> Result<AddressMode, Decision> {
              support if it was not written there"
         ))),
     }
+}
+
+/// What a whitelist does with a destination it does not list, once read.
+#[derive(Clone, Copy)]
+enum Unlisted {
+    Refuse,
+    Ask,
+}
+
+/// Read `addresses.unlisted`, or refuse the request naming the word that cannot
+/// be read — the posture of [`address_mode`]. Absent means `refuse`.
+fn unlisted_rule(addresses: &Addresses) -> Result<Unlisted, Decision> {
+    match addresses.unlisted.as_deref().unwrap_or("refuse") {
+        "refuse" => Ok(Unlisted::Refuse),
+        "ask" => Ok(Unlisted::Ask),
+        other => Err(deny(format!(
+            "this wallet's policy is not readable: addresses.unlisted '{other}' is not one of \
+             refuse, ask. Nothing is signed while a rule cannot be applied — re-save the policy \
+             in the dashboard, or contact support if it was not written there"
+        ))),
+    }
+}
+
+/// Whether `approval.auto_up_to` lets this op run without the approvers
+/// ([`AutoUpTo`]). `false` is "waits", and is the answer to everything that
+/// cannot be shown to fit.
+fn runs_without_approvers(approval: &Approval, op: &Op, amount: Option<u128>, usage: Option<&Usage>) -> bool {
+    if !op.runs_inside_auto_window() {
+        return false;
+    }
+    let (Some(up_to), Some(amount), Some(usage)) = (approval.auto_up_to.as_ref(), amount, usage) else {
+        return false;
+    };
+    if usage.all_unreadable {
+        return false;
+    }
+    let token = op.token();
+    let mut named = false;
+    for (window, entries) in up_to.windows() {
+        let Some(raw) = entries.and_then(|m| m.get(token)) else { continue };
+        let Ok(max) = raw.parse::<u128>() else { return false };
+        if usage.unreadable.contains(&format!("{window}:{token}")) {
+            return false;
+        }
+        let spent = match window {
+            "hourly" => &usage.hourly,
+            "daily" => &usage.daily,
+            _ => &usage.monthly,
+        }
+        .get(token)
+        .copied()
+        .unwrap_or(0);
+        if spent.saturating_add(amount) > max {
+            return false;
+        }
+        named = true;
+    }
+    named
 }
 
 /// Whether a listed address and a destination are the same address.
@@ -5854,4 +6099,298 @@ mod tests {
         assert_eq!(evaluate(&policy, &split, Some(&less_spent), 0), Decision::Allow);
     }
 
+    fn asking_policy(approval: serde_json::Value, rules: serde_json::Value) -> Policy {
+        policy_from(json!({ "rules": rules, "approval": approval }))
+    }
+
+    fn spent_today(token: &str, n: u128) -> Usage {
+        usage_json(json!({ token: n.to_string() }), json!({}), json!({}), 0)
+    }
+
+    /// `approval.auto_up_to`: while the day's total stays at most the entry the
+    /// payment runs; the one that would cross it waits; above a limit is refused.
+    #[test]
+    fn a_payment_inside_the_window_runs_and_the_one_that_crosses_it_waits() {
+        let policy = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "o.near"}],
+                    "auto_up_to": { "daily": { "native": "10", "nep141:usdc": "50" } } }),
+            json!({ "limits": { "per_transaction": { "native": "20" }, "daily": { "native": "40" } } }),
+        );
+        let waits = Decision::RequiresApproval { threshold: 1 };
+        let at = |n: u128| spent_today("native", n);
+        assert_eq!(evaluate(&policy, &transfer("10"), Some(&at(0)), 0), Decision::Allow);
+        assert_eq!(evaluate(&policy, &transfer("11"), Some(&at(0)), 0), waits, "above the entry by itself");
+        assert_eq!(evaluate(&policy, &transfer("4"), Some(&at(6)), 0), Decision::Allow);
+        assert_eq!(evaluate(&policy, &transfer("5"), Some(&at(6)), 0), waits, "the day's total would cross it");
+        // What was approved counts: after it, the rest of the day waits.
+        assert_eq!(evaluate(&policy, &transfer("1"), Some(&at(20)), 0), waits);
+        assert!(matches!(evaluate(&policy, &transfer("21"), Some(&at(0)), 0), Decision::Deny { .. }));
+        assert!(matches!(evaluate(&policy, &transfer("5"), Some(&at(36)), 0), Decision::Deny { .. }));
+
+        let withdraw = |amount: &str, token: &str| Op::Withdraw {
+            to: "bob.near".into(),
+            amount: amount.into(),
+            token: token.into(),
+        };
+        // Each token has its own purse: native spend is not USDC spend.
+        assert_eq!(evaluate(&policy, &withdraw("50", "nep141:usdc"), Some(&at(10)), 0), Decision::Allow);
+        assert_eq!(evaluate(&policy, &withdraw("51", "nep141:usdc"), Some(&at(0)), 0), waits);
+        // A token no window names always waits.
+        assert_eq!(evaluate(&policy, &withdraw("1", "nep141:other"), Some(&at(0)), 0), waits);
+    }
+
+    /// Every window that names the token has to hold.
+    #[test]
+    fn every_window_that_names_the_token_has_to_hold() {
+        let policy = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "o.near"}],
+                    "auto_up_to": { "hourly": { "native": "5" }, "daily": { "native": "10" }, "monthly": { "native": "100" } } }),
+            json!({}),
+        );
+        let waits = Decision::RequiresApproval { threshold: 1 };
+        let u = |h: u128, d: u128, m: u128| usage_json(json!({ "native": d.to_string() }), json!({ "native": h.to_string() }), json!({ "native": m.to_string() }), 0);
+        assert_eq!(evaluate(&policy, &transfer("5"), Some(&u(0, 5, 95)), 0), Decision::Allow);
+        assert_eq!(evaluate(&policy, &transfer("5"), Some(&u(1, 1, 1)), 0), waits, "hour");
+        assert_eq!(evaluate(&policy, &transfer("5"), Some(&u(0, 6, 6)), 0), waits, "day");
+        assert_eq!(evaluate(&policy, &transfer("5"), Some(&u(0, 0, 96)), 0), waits, "month");
+    }
+
+    /// Without counters, or with counters nobody could read, it waits: an
+    /// unknown total is never "nothing spent".
+    #[test]
+    fn a_window_we_cannot_measure_waits() {
+        let policy = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "o.near"}], "auto_up_to": { "daily": { "native": "10" } } }),
+            json!({}),
+        );
+        let waits = Decision::RequiresApproval { threshold: 1 };
+        assert_eq!(evaluate(&policy, &transfer("1"), None, 0), waits);
+        let lost = Usage::from_current_usage(&serde_json::Value::Null);
+        assert_eq!(evaluate(&policy, &transfer("1"), Some(&lost), 0), waits);
+        let garbled = Usage::from_current_usage(&json!({ "daily": { "native": "1e3" }, "hourly": {}, "monthly": {} }));
+        assert_eq!(evaluate(&policy, &transfer("1"), Some(&garbled), 0), waits);
+        // Another token's unreadable row is not this payment's problem.
+        let other = Usage::from_current_usage(&json!({ "daily": { "t": "x" }, "hourly": {}, "monthly": {} }));
+        assert_eq!(evaluate(&policy, &transfer("1"), Some(&other), 0), Decision::Allow);
+    }
+
+    /// Every fund-moving kind is named: the three the keystore builds and the
+    /// windows count may run inside the window, the rest wait whatever it says.
+    #[test]
+    fn only_a_transfer_a_withdrawal_and_an_intents_transfer_run_inside_the_window() {
+        let caps = json!({
+            "swap": { "allowed": true }, "confidential": { "allowed": true },
+            "cross_chain_withdraw": { "allowed": true }, "limit_order": { "allowed": true },
+            "payment_check": { "allowed": true },
+        });
+        let policy = policy_from(json!({
+            "capabilities": caps,
+            "approval": { "threshold": 1, "approvers": [{"id": "o.near"}],
+                          "auto_up_to": { "daily": { "native": "100", "t": "100", "nep141:wrap.near": "100" } } },
+        }));
+        let nothing = spent_today("t", 0);
+        let s = |v: &str| v.to_string();
+        let alone = [
+            Op::Transfer { to: s("b.near"), amount: s("1") },
+            Op::Withdraw { to: s("b.near"), amount: s("1"), token: s("t") },
+            Op::IntentsTransfer { to: s("b.near"), amount: s("1"), token: s("t") },
+        ];
+        for op in &alone {
+            assert!(op.runs_inside_auto_window(), "{op:?}");
+            assert_eq!(evaluate(&policy, op, Some(&nothing), 0), Decision::Allow, "{op:?}");
+        }
+        let waits = [
+            Op::Call { to: s("c.near"), method: s("ft_transfer"), args_base64: s("e30="), gas: s("1"), deposit: s("1") },
+            Op::Delete { beneficiary: s("b.near") },
+            Op::IntentsStorageDeposit { contract_id: s("c.near"), account_id: s("b.near"), amount: s("1") },
+            Op::Swap { token_in: s("t"), amount_in: s("1"), token_out: s("u"), min_out: s("1") },
+            Op::Confidential { flow: s("transfer"), to: Some(s("b.near")), amount: s("1"), token: s("t"), chain: None, token_out: None, min_amount_out: None },
+            Op::CrossChainWithdraw { to: s("0xabc"), amount: s("1"), token: s("t"), chain: s("base") },
+            Op::LimitOrder { to: s("b.near"), to_type: RecipientType::Intents, amount: s("1"), token: s("t"), token_out: s("u"), min_amount_out: s("1") },
+            Op::PaymentCheck { amount: s("1"), token: s("t") },
+        ];
+        for op in &waits {
+            assert!(!op.runs_inside_auto_window(), "{op:?}");
+            assert_eq!(evaluate(&policy, op, Some(&nothing), 0), Decision::RequiresApproval { threshold: 1 }, "{op:?}");
+        }
+    }
+
+    /// An entry nobody can read as a number waits; it never reads as "no
+    /// threshold". `*` is not a token. Neither is stored.
+    #[test]
+    fn a_window_entry_we_cannot_read_waits() {
+        let plus = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "a"}], "auto_up_to": { "daily": { "native": "+5" } } }),
+            json!({}),
+        );
+        assert!(policy_is_storable(&plus).is_err(), "digits only");
+        for up_to in [json!({ "daily": { "native": "0.5" } }), json!({ "hourly": { "native": "" } }), json!({ "monthly": { "*": "100" } })] {
+            let policy = asking_policy(
+                json!({ "threshold": 2, "approvers": [{"id": "a"}, {"id": "b"}], "auto_up_to": up_to }),
+                json!({}),
+            );
+            assert_eq!(evaluate(&policy, &transfer("1"), Some(&spent_today("native", 0)), 0), Decision::RequiresApproval { threshold: 2 });
+            assert!(policy_is_storable(&policy).is_err(), "{up_to}");
+        }
+        // A readable window beside an unreadable one does not rescue it.
+        let mixed = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "a"}], "auto_up_to": { "daily": { "native": "10" }, "hourly": { "native": "x" } } }),
+            json!({}),
+        );
+        assert_eq!(evaluate(&mixed, &transfer("1"), Some(&spent_today("native", 0)), 0), Decision::RequiresApproval { threshold: 1 });
+    }
+
+    /// A policy with none of the new fields decides as it did.
+    #[test]
+    fn a_policy_without_the_new_fields_is_unchanged() {
+        let policy = asking_policy(
+            json!({ "threshold": 2, "approvers": [{"id": "a"}, {"id": "b"}], "excluded_types": ["withdraw"] }),
+            json!({ "addresses": { "mode": "whitelist", "list": ["bob.near"] } }),
+        );
+        assert_eq!(evaluate(&policy, &transfer("1"), None, 0), Decision::Deny { reason: "Address 'dest.near' is not in whitelist".into() });
+        let to_bob = |amount: &str| Op::Transfer { to: "bob.near".into(), amount: amount.into() };
+        assert_eq!(evaluate(&policy, &to_bob("1"), None, 0), Decision::RequiresApproval { threshold: 2 });
+        let withdraw = Op::Withdraw { to: "bob.near".into(), amount: "1".into(), token: "t".into() };
+        assert_eq!(evaluate(&policy, &withdraw, None, 0), Decision::Allow);
+        assert!(policy_is_storable(&policy).is_ok());
+        // Neither field is written into a policy that does not have it.
+        let text = serde_json::to_string(&policy).unwrap();
+        assert!(!text.contains("auto_up_to") && !text.contains("unlisted"), "{text}");
+    }
+
+    /// `addresses.unlisted: "ask"`: an address off the list waits, a listed one
+    /// is judged as before, and nothing else lets the new address through.
+    #[test]
+    fn an_unlisted_address_waits_when_the_whitelist_asks() {
+        let policy = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "o.near"}],
+                    "auto_up_to": { "daily": { "native": "100" } }, "excluded_types": ["transfer"] }),
+            json!({ "addresses": { "mode": "whitelist", "list": ["bob.near"], "unlisted": "ask" },
+                    "limits": { "per_transaction": { "native": "50" } } }),
+        );
+        let to = |who: &str, amount: &str| Op::Transfer { to: who.into(), amount: amount.into() };
+        // Listed: the excluded type and the threshold apply.
+        assert_eq!(evaluate(&policy, &to("bob.near", "10"), None, 0), Decision::Allow);
+        // New: waits, though its type is excluded and its amount is under the threshold.
+        assert_eq!(evaluate(&policy, &to("eve.near", "1"), None, 0), Decision::RequiresApproval { threshold: 1 });
+        // New, and over a limit: refused, not asked about.
+        assert!(matches!(evaluate(&policy, &to("eve.near", "51"), None, 0), Decision::Deny { .. }));
+        // New, and of a type the policy does not permit: refused.
+        let typed = asking_policy(
+            json!({ "threshold": 1, "approvers": [{"id": "o.near"}] }),
+            json!({ "transaction_types": ["withdraw"],
+                    "addresses": { "list": ["bob.near"], "unlisted": "ask" } }),
+        );
+        assert!(matches!(evaluate(&typed, &to("eve.near", "1"), None, 0), Decision::Deny { .. }));
+        // A frozen wallet does not ask.
+        let mut frozen = policy.clone();
+        frozen.frozen = true;
+        assert_eq!(evaluate(&frozen, &to("eve.near", "1"), None, 0), Decision::Frozen);
+    }
+
+    /// Asking with nobody to ask is a refusal, when evaluated and when stored.
+    #[test]
+    fn asking_about_an_address_needs_somebody_to_ask() {
+        let rules = json!({ "addresses": { "list": ["bob.near"], "unlisted": "ask" } });
+        let nobody = policy_from(json!({ "rules": rules }));
+        match evaluate(&nobody, &transfer("1"), None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("no approval threshold"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(policy_is_storable(&nobody).is_err());
+        let err = |approval: serde_json::Value, addresses: serde_json::Value| {
+            policy_is_storable(&asking_policy(approval, json!({ "addresses": addresses }))).expect_err("refused")
+        };
+        let ask = json!({ "list": ["bob.near"], "unlisted": "ask" });
+        assert!(err(json!({ "approvers": [{"id": "a"}] }), ask.clone()).contains("threshold"));
+        assert!(err(json!({ "threshold": 2, "approvers": [{"id": "a"}] }), ask.clone()).contains("never be approved"));
+        let quorum = json!({ "threshold": 1, "approvers": [{"id": "a"}] });
+        assert!(err(quorum.clone(), json!({ "mode": "blacklist", "list": [], "unlisted": "ask" })).contains("whitelist"));
+        assert!(err(quorum.clone(), json!({ "list": [], "unlisted": "prompt" })).contains("not one of"));
+        assert!(policy_is_storable(&asking_policy(quorum.clone(), json!({ "addresses": ask }))).is_ok());
+        assert!(policy_is_storable(&asking_policy(quorum, json!({ "addresses": { "list": [], "unlisted": "refuse" } }))).is_ok());
+    }
+
+    /// A word we cannot read refuses; `refuse` and a blacklist behave as before.
+    #[test]
+    fn an_unlisted_rule_we_cannot_read_refuses() {
+        let quorum = json!({ "threshold": 1, "approvers": [{"id": "a"}] });
+        let typo = asking_policy(quorum.clone(), json!({ "addresses": { "list": ["dest.near"], "unlisted": "prompt" } }));
+        match evaluate(&typo, &transfer("1"), None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("addresses.unlisted 'prompt'"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        let refuse = asking_policy(quorum.clone(), json!({ "addresses": { "list": ["bob.near"], "unlisted": "refuse" } }));
+        assert!(matches!(evaluate(&refuse, &transfer("1"), None, 0), Decision::Deny { .. }));
+        let black = asking_policy(quorum, json!({ "addresses": { "mode": "blacklist", "list": ["dest.near"], "unlisted": "ask" } }));
+        assert_eq!(evaluate(&black, &transfer("1"), None, 0), Decision::Deny { reason: "Address 'dest.near' is blacklisted".into() });
+    }
+
+    /// Only a payment is asked about. Every other kind aimed off the list is
+    /// refused, asking or not.
+    #[test]
+    fn only_a_payment_to_an_unlisted_address_is_asked_about() {
+        let policy = policy_from(json!({
+            "rules": { "addresses": { "list": ["bob.near"], "unlisted": "ask" } },
+            "capabilities": { "cross_chain_withdraw": { "allowed": true }, "limit_order": { "allowed": true },
+                              "confidential": { "allowed": true } },
+            "approval": { "threshold": 1, "approvers": [{"id": "o.near"}] },
+        }));
+        let s = |v: &str| v.to_string();
+        let asked = [
+            Op::Transfer { to: s("eve.near"), amount: s("1") },
+            Op::Withdraw { to: s("eve.near"), amount: s("1"), token: s("t") },
+            Op::IntentsTransfer { to: s("eve.near"), amount: s("1"), token: s("t") },
+            Op::CrossChainWithdraw { to: s("0xabc"), amount: s("1"), token: s("t"), chain: s("base") },
+        ];
+        for op in &asked {
+            assert!(op.may_ask_about_destination(), "{op:?}");
+            assert_eq!(evaluate(&policy, op, None, 0), Decision::RequiresApproval { threshold: 1 }, "{op:?}");
+        }
+        let refused = [
+            Op::Call { to: s("eve.near"), method: s("ft_transfer"), args_base64: s("e30="), gas: s("1"), deposit: s("1") },
+            Op::Delete { beneficiary: s("eve.near") },
+            Op::IntentsStorageDeposit { contract_id: s("eve.near"), account_id: s("b.near"), amount: s("1") },
+            Op::LimitOrder { to: s("eve.near"), to_type: RecipientType::Intents, amount: s("1"), token: s("t"), token_out: s("u"), min_amount_out: s("1") },
+            Op::Confidential { flow: s("transfer"), to: Some(s("eve.near")), amount: s("1"), token: s("t"), chain: None, token_out: None, min_amount_out: None },
+        ];
+        for op in &refused {
+            assert!(!op.may_ask_about_destination(), "{op:?}");
+            match evaluate(&policy, op, None, 0) {
+                Decision::Deny { reason } => assert!(reason.contains("not in whitelist"), "{op:?}: {reason}"),
+                other => panic!("{op:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Inside a `w_execute_extension` request an unlisted account is refused,
+    /// asking or not.
+    #[test]
+    fn accounts_inside_an_extension_request_are_not_asked_about() {
+        use base64::Engine;
+        let mut policy = door_policy();
+        policy.rules.as_mut().unwrap().addresses.as_mut().unwrap().unlisted = Some("ask".into());
+        policy.approval = Some(Approval { threshold: Some(Threshold::Number(1)), ..Approval::default() });
+        // token.near is listed, bob.near is not: the token's recipient is inside the request.
+        let ft = base64::engine::general_purpose::STANDARD.encode(r#"{"receiver_id":"bob.near","amount":"5"}"#);
+        let op = door_op(&format!(
+            r#"{{"request":{{"external":[{{
+                "receiver_id":"token.near",
+                "actions":[{{"action":"function_call","payload":{{
+                    "function_name":"ft_transfer","args":"{ft}","deposit":"1"}}}}]}}]}}}}"#
+        ));
+        match evaluate(&policy, &op, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("bob.near"), "{reason}"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+        // Aimed at an account off the list, the call itself is refused too: a
+        // call is not a payment.
+        let Op::Call { method, args_base64, gas, deposit, .. } = op else { unreachable!() };
+        let elsewhere = Op::Call { to: "other.tla".into(), method, args_base64, gas, deposit };
+        policy.rules.as_mut().unwrap().addresses.as_mut().unwrap().list.push("bob.near".into());
+        match evaluate(&policy, &elsewhere, None, 0) {
+            Decision::Deny { reason } => assert!(reason.contains("'other.tla' is not in whitelist"), "{reason}"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
 }
