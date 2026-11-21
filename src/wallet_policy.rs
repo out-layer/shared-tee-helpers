@@ -119,6 +119,23 @@ pub const INTENTS_WNEAR_TOKEN: &str = "nep141:wrap.near";
 /// confidential shard's verifier, the second name `sign_message` never signs for.
 pub const INTENTS_CONTRACTS: &[&str] = &["intents.near", "intents.far"];
 
+/// The keystore DAO contract accounts. A call to one, from the wallet's own account or
+/// nested in a `w_execute_extension` on an account the wallet is bound to, is refused
+/// outright and no policy opens it.
+///
+/// The DAO contract is where an owner starts and claims the exit of their wallets
+/// (`initiate_exit`, `claim_escrow_key`): it knows the caller only as the predecessor. A
+/// wallet bound to its owner's account through Agent Connect would be that predecessor, so
+/// the agent holding the wallet's key could leave with the owner's master. Nothing a wallet
+/// does needs this contract.
+pub const KEYSTORE_DAO_CONTRACTS: &[&str] = &["dao.outlayer.near", "dao.outlayer.testnet"];
+
+/// Whether `account` is a keystore DAO contract (compared as [`is_intents_contract`] does).
+pub fn is_keystore_dao_contract(account: &str) -> bool {
+    let a = account.trim().to_ascii_lowercase();
+    KEYSTORE_DAO_CONTRACTS.iter().any(|c| *c == a)
+}
+
 /// Methods named in `Op::Call`s to the intents contract that exist only to be
 /// evaluated by the policy, never signed. None of them is a method of the contract.
 pub const GATE_ONLY_INTENTS_METHODS: &[&str] = &["cross_chain_deposit"];
@@ -592,7 +609,10 @@ pub enum Op {
     /// with a fresh timestamp and signs it RAW ed25519 (NOT NEP-413). It is non-fund
     /// (never a 32-byte tx hash), so it is always allowed — no capability or multisig —
     /// on a wallet that is not frozen. `purpose` selects the prefix: `bearer`→`auth`,
-    /// `register`→`register`, `api-key`→`api-key`. `vault_id` is only valid for `bearer`.
+    /// `register`→`register`, `api-key`→`api-key`. `vault_id` is valid for `bearer` and
+    /// `api-key`. `key_hash` — the sha256 of the key being registered, 64 lower-case hex —
+    /// is required for `api-key` and refused for the others: the signature names the key
+    /// it authorizes.
     ///
     /// `purpose: "jwt"` is the confidential shard's session proof: a NEP-413 signature
     /// over a challenge the keystore builds with an EMPTY `intents` array. It alone
@@ -602,6 +622,8 @@ pub enum Op {
         seed: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vault_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_hash: Option<String>,
     },
 
     /// A new policy for a wallet whose current policy is locked (`approval.locked`).
@@ -749,27 +771,75 @@ pub fn lock_is_satisfiable(policy: &Policy) -> Result<(), String> {
 /// identical to the coordinator's formats:
 /// - `bearer`   → `auth:<seed>:<ts>` or `auth:<seed>:<ts>:<vault_id>`
 /// - `register` → `register:<seed>:<ts>` (no vault in the signed message)
-/// - `api-key`  → `api-key:<seed>:<ts>` (no vault in the signed message)
+/// - `api-key`  → `api-key:<seed>:<ts>:<key_hash>` or `api-key:<seed>:<ts>:<key_hash>:<vault_id>`
+///
+/// An `api-key` signature registers a key for a wallet, so it names that key and the vault
+/// the wallet is in: a signature seen in transit authorizes nothing else. No part holds a
+/// `:` — a seed is `[a-zA-Z0-9._-]`, a key hash is hex, and a vault is an account id, which
+/// the caller checks before it builds an `Op::Auth` — so the parts cannot run into each
+/// other.
 pub fn build_auth_message(
     purpose: &str,
     seed: &str,
     timestamp: u64,
     vault_id: Option<&str>,
+    key_hash: Option<&str>,
 ) -> Result<String, String> {
-    let prefix = match purpose {
-        "bearer" => "auth",
-        "register" => "register",
-        "api-key" => "api-key",
-        other => return Err(format!("unknown auth purpose '{}'", other)),
-    };
-    match (purpose, vault_id) {
-        ("bearer", Some(vid)) => Ok(format!("auth:{}:{}:{}", seed, timestamp, vid)),
-        (_, Some(_)) => Err(format!(
-            "auth purpose '{}' does not carry vault_id in the signed message",
-            purpose
-        )),
-        (_, None) => Ok(format!("{}:{}:{}", prefix, seed, timestamp)),
+    match (purpose, vault_id, key_hash) {
+        ("bearer", None, None) => Ok(format!("auth:{seed}:{timestamp}")),
+        ("bearer", Some(vid), None) => Ok(format!("auth:{seed}:{timestamp}:{vid}")),
+        ("register", None, None) => Ok(format!("register:{seed}:{timestamp}")),
+        ("api-key", vault, Some(key_hash)) => {
+            if !is_key_hash(key_hash) {
+                return Err("key_hash must be 64 lower-case hex characters (sha256 of the key)".to_string());
+            }
+            Ok(match vault {
+                Some(vid) => format!("api-key:{seed}:{timestamp}:{key_hash}:{vid}"),
+                None => format!("api-key:{seed}:{timestamp}:{key_hash}"),
+            })
+        }
+        ("api-key", _, None) => Err("auth purpose 'api-key' needs key_hash: the signature names the key it registers".to_string()),
+        ("bearer" | "register", _, Some(_)) => Err(format!("auth purpose '{purpose}' does not carry key_hash")),
+        ("register", Some(_), _) => Err("auth purpose 'register' does not carry vault_id in the signed message".to_string()),
+        (other, _, _) => Err(format!("unknown auth purpose '{other}'")),
     }
+}
+
+/// The sha256 of an API key as every signed message and stored row writes it: 64 lower-case
+/// hex characters.
+pub fn is_key_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What an `api-key:<seed>:<ts>:<key_hash>[:<vault_id>]` message says, after checking that
+/// it is of that form and names `expected_seed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyMessage {
+    pub timestamp: u64,
+    pub key_hash: String,
+    pub vault_id: Option<String>,
+}
+
+/// Read an `api-key` signed message. Refused when it is of any other form, the old
+/// `api-key:<seed>:<ts>` included.
+pub fn parse_api_key_message(message: &str, expected_seed: &str) -> Result<ApiKeyMessage, String> {
+    const FORM: &str = "message must be 'api-key:<seed>:<timestamp>:<key_hash>[:<vault_id>]'";
+    let parts: Vec<&str> = message.split(':').collect();
+    let (seed, timestamp, key_hash, vault_id) = match parts.as_slice() {
+        ["api-key", seed, timestamp, key_hash] => (*seed, *timestamp, *key_hash, None),
+        ["api-key", seed, timestamp, key_hash, vault] if !vault.is_empty() => {
+            (*seed, *timestamp, *key_hash, Some(vault.to_string()))
+        }
+        _ => return Err(FORM.to_string()),
+    };
+    if seed != expected_seed {
+        return Err("seed in message does not match seed field".to_string());
+    }
+    let timestamp: u64 = timestamp.parse().map_err(|_| "Invalid timestamp in message".to_string())?;
+    if !is_key_hash(key_hash) {
+        return Err(FORM.to_string());
+    }
+    Ok(ApiKeyMessage { timestamp, key_hash: key_hash.to_string(), vault_id })
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,6 +2509,23 @@ fn check_capabilities(
         // A limit order pays out unattended, to an address of the caller's choosing →
         // default-DENY on the same footing as the exit it can become.
         Op::LimitOrder { .. } => (caps.and_then(|c| c.limit_order.as_ref()), false),
+        // SECURITY: the keystore DAO takes its caller for an owner. Never, under any
+        // policy. See `KEYSTORE_DAO_CONTRACTS`.
+        Op::Call { to, .. } if is_keystore_dao_contract(to) => {
+            return Some(deny(format!(
+                "A call to '{to}' is refused: the keystore DAO is where an owner leaves with their \
+                 wallets, and a wallet never calls it"
+            )));
+        }
+        Op::Call { method, args_base64, .. }
+            if method == "w_execute_extension" && extension_reaches(args_base64, is_keystore_dao_contract) =>
+        {
+            return Some(deny(
+                "A w_execute_extension promise aimed at the keystore DAO is refused: it would act as \
+                 the bound account, which the DAO takes for an owner leaving with their wallets"
+                    .to_string(),
+            ));
+        }
         // SECURITY: a call to the intents contract acts as the wallet's intents
         // account itself — default-DENY. See the block at `INTENTS_CONTRACTS`.
         Op::Call { to, method, .. } if is_fenced_intents_call(to, method) => {
@@ -2525,6 +2612,13 @@ fn intents_call_decision(
 /// intents contract. A request that does not decode is refused earlier
 /// (`evaluate_extension_call`), so it reads `false` here.
 fn extension_reaches_intents(args_base64: &str) -> bool {
+    extension_reaches(args_base64, is_intents_contract)
+}
+
+/// Whether a `w_execute_extension` request has a promise whose receiver `is_fenced`. A
+/// request that does not decode is refused earlier (`evaluate_extension_call`), so it reads
+/// `false` here.
+fn extension_reaches(args_base64: &str, is_fenced: fn(&str) -> bool) -> bool {
     use crate::wallet_request_decode::{decode, effects};
     use base64::Engine;
     let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(args_base64) else {
@@ -2532,7 +2626,7 @@ fn extension_reaches_intents(args_base64: &str) -> bool {
     };
     let Ok(envelope) = decode(&raw) else { return false };
     let Ok(fx) = effects(&envelope, raw.len()) else { return false };
-    fx.receivers.iter().any(|r| is_intents_contract(r))
+    fx.receivers.iter().any(|r| is_fenced(r))
 }
 
 /// What a capability's `requires_approval` turns into. The threshold comes from the
@@ -4482,34 +4576,134 @@ mod tests {
         assert_eq!(evaluate(&opened, &extension_to("intents.near"), None, 0), Decision::Allow);
     }
 
+    /// SECURITY guard for `KEYSTORE_DAO_CONTRACTS`: no policy lets a wallet call the
+    /// keystore DAO, directly or as the account it is bound to.
+    #[test]
+    fn calls_to_the_keystore_dao_are_refused_under_every_policy() {
+        let direct = |to: &str| Op::Call {
+            to: to.into(),
+            method: "initiate_exit".into(),
+            args_base64: "e30=".into(),
+            gas: "100000000000000".into(),
+            deposit: "100000000000000000000000".into(),
+        };
+        let policies = [
+            policy_from(json!({})),
+            policy_from(json!({ "rules": { "transaction_types": ["call"] } })),
+            policy_from(json!({ "capabilities": { "intents_call": { "allowed": true } } })),
+        ];
+        for policy in &policies {
+            for dao in ["dao.outlayer.near", "dao.outlayer.testnet", " DAO.outlayer.near "] {
+                match evaluate(policy, &direct(dao), None, 0) {
+                    Decision::Deny { reason } => assert!(reason.contains("keystore DAO"), "{reason}"),
+                    d => panic!("a call to {dao} passed: {d:?}"),
+                }
+                match evaluate(policy, &extension_to(dao.trim().to_ascii_lowercase().as_str()), None, 0) {
+                    Decision::Deny { reason } => assert!(reason.contains("keystore DAO"), "{reason}"),
+                    d => panic!("a nested call to {dao} passed: {d:?}"),
+                }
+            }
+            // Another contract is judged as before.
+            assert_eq!(evaluate(policy, &extension_to("usdc.near"), None, 0), Decision::Allow);
+        }
+    }
+
+    /// SECURITY guard: the fences read the receivers of ONE request. A promise that calls
+    /// `w_execute_extension` again carries a second request nobody read; it is a call whose
+    /// effects cannot be stated, and such a call is refused under every policy — whatever
+    /// account it is aimed at, the bound account itself included.
+    #[test]
+    fn a_request_nested_in_a_request_is_refused_under_every_policy() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        // The inner request: a promise to the keystore DAO.
+        let inner = r#"{"request":{"external":[{"receiver_id":"dao.outlayer.near","actions":[{"action":"function_call","payload":{"function_name":"initiate_exit","args":"e30=","deposit":"100000000000000000000000"}}]}]}}"#;
+        let nested_on = |receiver: &str| {
+            let outer = format!(
+                r#"{{"request":{{"external":[{{"receiver_id":"{receiver}","actions":[{{"action":"function_call","payload":{{"function_name":"w_execute_extension","args":"{}","deposit":"1"}}}}]}}]}}}}"#,
+                b64(inner)
+            );
+            Op::Call {
+                to: "alice.near".into(),
+                method: "w_execute_extension".into(),
+                args_base64: b64(&outer),
+                gas: "100000000000000".into(),
+                deposit: "1".into(),
+            }
+        };
+        for policy in [
+            policy_from(json!({})),
+            policy_from(json!({ "rules": { "transaction_types": ["call"] } })),
+            policy_from(json!({ "capabilities": { "intents_call": { "allowed": true } } })),
+        ] {
+            for receiver in ["alice.near", "other-wallet.near"] {
+                match evaluate(&policy, &nested_on(receiver), None, 0) {
+                    Decision::Deny { reason } => {
+                        assert!(reason.contains("cannot state the effects") && reason.contains("w_execute_extension"), "{reason}")
+                    }
+                    d => panic!("a request nested on {receiver} passed: {d:?}"),
+                }
+            }
+            // A request that nests nothing is judged as before.
+            assert_eq!(evaluate(&policy, &extension_to("usdc.near"), None, 0), Decision::Allow);
+        }
+    }
+
     #[test]
     fn auth_message_formats_match_coordinator() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         // bearer → `auth:<seed>:<ts>` (+ optional vault).
+        assert_eq!(build_auth_message("bearer", "default", 1_700_000_000, None, None).unwrap(), "auth:default:1700000000");
         assert_eq!(
-            build_auth_message("bearer", "default", 1_700_000_000, None).unwrap(),
-            "auth:default:1700000000"
-        );
-        assert_eq!(
-            build_auth_message("bearer", "default", 1_700_000_000, Some("v1.vault.near")).unwrap(),
+            build_auth_message("bearer", "default", 1_700_000_000, Some("v1.vault.near"), None).unwrap(),
             "auth:default:1700000000:v1.vault.near"
         );
-        // register / api-key → `<prefix>:<seed>:<ts>`, no vault in the signed message.
+        // register → `register:<seed>:<ts>`, no vault in the signed message.
+        assert_eq!(build_auth_message("register", "s", 42, None, None).unwrap(), "register:s:42");
+        assert!(build_auth_message("register", "s", 42, Some("v"), None).is_err());
+        // api-key names the key it registers, and the vault when there is one.
+        assert_eq!(build_auth_message("api-key", "s", 42, None, Some(KEY)).unwrap(), format!("api-key:s:42:{KEY}"));
         assert_eq!(
-            build_auth_message("register", "s", 42, None).unwrap(),
-            "register:s:42"
+            build_auth_message("api-key", "s", 42, Some("vault.alice.near"), Some(KEY)).unwrap(),
+            format!("api-key:s:42:{KEY}:vault.alice.near")
         );
+        assert!(build_auth_message("api-key", "s", 42, None, None).is_err(), "no key named");
+        assert!(build_auth_message("api-key", "s", 42, None, Some("ABCD")).is_err(), "not a key hash");
+        assert!(build_auth_message("api-key", "s", 42, None, Some(&KEY.to_uppercase())).is_err());
+        // The other purposes carry no key; an unknown purpose is refused.
+        assert!(build_auth_message("bearer", "s", 42, None, Some(KEY)).is_err());
+        assert!(build_auth_message("register", "s", 42, None, Some(KEY)).is_err());
+        assert!(build_auth_message("nope", "s", 42, None, None).is_err());
+    }
+
+    #[test]
+    fn an_api_key_message_is_read_back_and_no_other_form_is() {
+        const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let plain = build_auth_message("api-key", "sub-1", 42, None, Some(KEY)).unwrap();
         assert_eq!(
-            build_auth_message("api-key", "s", 42, None).unwrap(),
-            "api-key:s:42"
+            parse_api_key_message(&plain, "sub-1").unwrap(),
+            ApiKeyMessage { timestamp: 42, key_hash: KEY.into(), vault_id: None }
         );
-        // register/api-key reject a vault_id; unknown purpose rejected.
-        assert!(build_auth_message("register", "s", 42, Some("v")).is_err());
-        assert!(build_auth_message("nope", "s", 42, None).is_err());
+        let vaulted = build_auth_message("api-key", "sub-1", 42, Some("vault.alice.near"), Some(KEY)).unwrap();
+        assert_eq!(parse_api_key_message(&vaulted, "sub-1").unwrap().vault_id.as_deref(), Some("vault.alice.near"));
+
+        assert!(parse_api_key_message(&plain, "sub-2").is_err(), "another seed");
+        for bad in [
+            "api-key:sub-1:42".to_string(),
+            format!("api-key:sub-1:42:{KEY}:"),
+            format!("api-key:sub-1:42:{KEY}:v:extra"),
+            format!("api-key:sub-1:x:{KEY}"),
+            format!("api-key:sub-1:42:{}", &KEY[..63]),
+            format!("api-key:sub-1:42:{}", KEY.to_uppercase()),
+            format!("auth:sub-1:42:{KEY}"),
+        ] {
+            assert!(parse_api_key_message(&bad, "sub-1").is_err(), "{bad}");
+        }
     }
 
     #[test]
     fn auth_allowed_under_restrictive_policy_but_blocked_when_frozen() {
-        let op = Op::Auth { purpose: "bearer".into(), seed: "default".into(), vault_id: None };
+        let op = Op::Auth { purpose: "bearer".into(), seed: "default".into(), vault_id: None, key_hash: None };
         assert_eq!(bind_mode(&op), BindMode::Built);
         // Allowed under a restrictive (non-frozen) policy with no auth capability.
         let restrictive = policy_from(json!({
@@ -4530,7 +4724,7 @@ mod tests {
     #[test]
     fn a_freeze_passes_the_confidential_session_proof_and_nothing_else() {
         let frozen = policy_from(json!({ "frozen": true }));
-        let auth = |purpose: &str| Op::Auth { purpose: purpose.into(), seed: "s".into(), vault_id: None };
+        let auth = |purpose: &str| Op::Auth { purpose: purpose.into(), seed: "s".into(), vault_id: None, key_hash: None };
         assert_eq!(evaluate(&frozen, &auth("jwt"), None, 0), Decision::Allow);
         for purpose in ["bearer", "register", "api-key", "JWT", "jwt ", ""] {
             assert_eq!(evaluate(&frozen, &auth(purpose), None, 0), Decision::Frozen, "{purpose:?}");
@@ -5344,7 +5538,7 @@ mod tests {
         assert_eq!(evaluate(&p, &transfer("1"), None, 0), Decision::Frozen);
 
         // And including the identity proofs an unfrozen wallet always allows.
-        let auth = Op::Auth { purpose: "bearer".into(), seed: "s".into(), vault_id: None };
+        let auth = Op::Auth { purpose: "bearer".into(), seed: "s".into(), vault_id: None, key_hash: None };
         assert_eq!(evaluate(&p, &auth, None, 0), Decision::Frozen);
     }
 
