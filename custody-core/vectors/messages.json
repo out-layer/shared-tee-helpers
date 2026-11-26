@@ -1,0 +1,124 @@
+{
+  "agent_seed": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "tee_seed": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+  "public_key": "bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5c91cb3ce2b84e4ba85f562ece41edfe4e27afc52d88d507f66a18638df823e9f",
+  "cases": [
+    {
+      "name": "a transfer of NEAR",
+      "message": {
+        "chain_id": "mainnet",
+        "signer_id": "trader.alice.near",
+        "nonce": 0,
+        "created_at_ns": "1800000000123456789",
+        "promise": {
+          "receiver_id": "bob.near",
+          "action": {
+            "action": "transfer",
+            "amount": "1000000000000000000000000"
+          }
+        }
+      },
+      "borsh": "00070000006d61696e6e6574110000007472616465722e616c6963652e6e6561720000000015cd0f9b76e2fa18100e0000000000000100000008000000626f622e6e656172000100000003000000a1edccce1bc2d3000000000000",
+      "hash": "3cd4dc91fe6a6d5360ee6f2e778a894eabd9a5a2596537300cdbd7c97706bd88",
+      "contract_json": "{\"chain_id\":\"mainnet\",\"signer_id\":\"trader.alice.near\",\"nonce\":0,\"created_at\":\"2027-01-15T08:00:00.123456789Z\",\"timeout_secs\":3600,\"request\":{\"external\":[{\"receiver_id\":\"bob.near\",\"actions\":[{\"action\":\"transfer\",\"payload\":{\"amount\":\"1000000000000000000000000\"}}]}]}}",
+      "agent_half": "82f9b5e928daf9f9092c5caf2136281539db6205d46fe6cef0111e098d6d85e71583c59da73f55d5f9e746d7eee740ea926d414fc3dadb4c4d9457c5d2d3d501",
+      "tee_half": "9e8a0762025d5ecc926804f0888e56ba052dfb8e2ed3f40d89629b7b814465d4dae2ebb24d2c7c1071c642d0d99feb408f6ddd536b713887f6d7d6e11e89630d"
+    },
+    {
+      "name": "a call",
+      "message": {
+        "chain_id": "mainnet",
+        "signer_id": "trader.alice.near",
+        "nonce": 1,
+        "created_at_ns": "1800000000123456789",
+        "promise": {
+          "receiver_id": "app.near",
+          "action": {
+            "action": "function_call",
+            "function_name": "do_it",
+            "args": "eyJ4IjoxfQ==",
+            "deposit": "1",
+            "gas": "30000000000000"
+          }
+        }
+      },
+      "borsh": "00070000006d61696e6e6574110000007472616465722e616c6963652e6e6561720100000015cd0f9b76e2fa18100e00000000000001000000080000006170702e6e65617200010000000205000000646f5f6974070000007b2278223a317d0100000000000000000000000000000000e057eb481b00000000000000000000",
+      "hash": "e292bbea976272d5e9635bdb119fd203200d3fc50f39e7b828be4fe5fc1158a4",
+      "contract_json": "{\"chain_id\":\"mainnet\",\"signer_id\":\"trader.alice.near\",\"nonce\":1,\"created_at\":\"2027-01-15T08:00:00.123456789Z\",\"timeout_secs\":3600,\"request\":{\"external\":[{\"receiver_id\":\"app.near\",\"actions\":[{\"action\":\"function_call\",\"payload\":{\"function_name\":\"do_it\",\"args\":\"eyJ4IjoxfQ==\",\"deposit\":\"1\",\"gas\":\"30000000000000\",\"gas_weight\":\"0\"}}]}]}}",
+      "agent_half": "7a136b0169759e015895b6b6026ae6d518c80bd239a10e1dbe3173e2748680b49822ee6e6cc631b3eb77efa3e86e0d846dc76d2b4fcb6a20d96778dd0abdd902",
+      "tee_half": "a6220ba8a3b4e309922483f4e5516f6981e345fbb3a6a5295b5bf98562432acb14c785a880331fd8f35c1bc4a7e0c944b7d63e959bb32fd5be1daa636b090300"
+    },
+    {
+      "name": "a call with empty arguments and the largest numbers",
+      "message": {
+        "chain_id": "mainnet",
+        "signer_id": "trader.alice.near",
+        "nonce": 2,
+        "created_at_ns": "1800000000123456789",
+        "promise": {
+          "receiver_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "action": {
+            "action": "function_call",
+            "function_name": "m",
+            "args": "",
+            "deposit": "340282366920938463463374607431768211455",
+            "gas": "250000000000000"
+          }
+        }
+      },
+      "borsh": "00070000006d61696e6e6574110000007472616465722e616c6963652e6e6561720200000015cd0f9b76e2fa18100e000000000000010000004000000066666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666000100000002010000006d00000000ffffffffffffffffffffffffffffffff00a031a95fe300000000000000000000",
+      "hash": "6c39b23898e00a04baf22fe092db91668a7085e4cf9b65504031073b9dfd60da",
+      "contract_json": "{\"chain_id\":\"mainnet\",\"signer_id\":\"trader.alice.near\",\"nonce\":2,\"created_at\":\"2027-01-15T08:00:00.123456789Z\",\"timeout_secs\":3600,\"request\":{\"external\":[{\"receiver_id\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"actions\":[{\"action\":\"function_call\",\"payload\":{\"function_name\":\"m\",\"args\":\"\",\"deposit\":\"340282366920938463463374607431768211455\",\"gas\":\"250000000000000\",\"gas_weight\":\"0\"}}]}]}}",
+      "agent_half": "4aa00734209b9f75bb10b0b1b949440bcb52609d94040be1f1e595a36a13aff6064e1f93c719bfb2db05a818f0900423970730a64b697328aedcd14078ded209",
+      "tee_half": "8795406edf9e57fe1dcb8faba25f4a13b812fe8985f22587e6117f7f2fc1ac50d25b744cf7fd253c545042f93af09614e675fdf449badfcd03246a84cbe52403"
+    },
+    {
+      "name": "a transfer inside NEAR Intents",
+      "message": {
+        "chain_id": "mainnet",
+        "signer_id": "trader.alice.near",
+        "nonce": 3,
+        "created_at_ns": "1800000000123456789",
+        "promise": {
+          "receiver_id": "intents.near",
+          "action": {
+            "action": "function_call",
+            "function_name": "mt_transfer",
+            "args": "eyJyZWNlaXZlcl9pZCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJ0b2tlbl9pZCI6Im5lcDE0MTp3cmFwLm5lYXIiLCJhbW91bnQiOiI1MDAwIn0=",
+            "deposit": "1",
+            "gas": "30000000000000"
+          }
+        }
+      },
+      "borsh": "00070000006d61696e6e6574110000007472616465722e616c6963652e6e6561720300000015cd0f9b76e2fa18100e000000000000010000000c000000696e74656e74732e6e6561720001000000020b0000006d745f7472616e73666572800000007b2272656365697665725f6964223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c22746f6b656e5f6964223a226e65703134313a777261702e6e656172222c22616d6f756e74223a2235303030227d0100000000000000000000000000000000e057eb481b00000000000000000000",
+      "hash": "739a10a3c756822803840cee53bb0eb2fbd781ca3224b8c943f5f11004dce743",
+      "contract_json": "{\"chain_id\":\"mainnet\",\"signer_id\":\"trader.alice.near\",\"nonce\":3,\"created_at\":\"2027-01-15T08:00:00.123456789Z\",\"timeout_secs\":3600,\"request\":{\"external\":[{\"receiver_id\":\"intents.near\",\"actions\":[{\"action\":\"function_call\",\"payload\":{\"function_name\":\"mt_transfer\",\"args\":\"eyJyZWNlaXZlcl9pZCI6IjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJ0b2tlbl9pZCI6Im5lcDE0MTp3cmFwLm5lYXIiLCJhbW91bnQiOiI1MDAwIn0=\",\"deposit\":\"1\",\"gas\":\"30000000000000\",\"gas_weight\":\"0\"}}]}]}}",
+      "agent_half": "2a183f8901ab7f113ba7d26c09855f489c435076530c636d5fd184ea35302b4c9da3de5ad280ceaa9e43e39edb2452eafe0448fc6d45aaf1816a8dea5598400d",
+      "tee_half": "034e940f58ce382cd93e382edec443089541e090097ef309d6b6f2e75d02c6f440d6f45028e279939451cf71b3447f65958c8f3ccf6351722f6e5c8c8e2f0d07"
+    },
+    {
+      "name": "a withdrawal from NEAR Intents to NEAR",
+      "message": {
+        "chain_id": "mainnet",
+        "signer_id": "trader.alice.near",
+        "nonce": 4,
+        "created_at_ns": "1800000000123456789",
+        "promise": {
+          "receiver_id": "intents.near",
+          "action": {
+            "action": "function_call",
+            "function_name": "ft_withdraw",
+            "args": "eyJ0b2tlbiI6InVzZHQudGV0aGVyLXRva2VuLm5lYXIiLCJyZWNlaXZlcl9pZCI6ImJvYi5uZWFyIiwiYW1vdW50IjoiNyJ9",
+            "deposit": "1",
+            "gas": "80000000000000"
+          }
+        }
+      },
+      "borsh": "00070000006d61696e6e6574110000007472616465722e616c6963652e6e6561720400000015cd0f9b76e2fa18100e000000000000010000000c000000696e74656e74732e6e6561720001000000020b00000066745f7769746864726177480000007b22746f6b656e223a22757364742e7465746865722d746f6b656e2e6e656172222c2272656365697665725f6964223a22626f622e6e656172222c22616d6f756e74223a2237227d0100000000000000000000000000000000009573c24800000000000000000000",
+      "hash": "00552d3f26574365a0b9e2edfcd25abbf66ecb07ebd6564e29ff97642ff395a5",
+      "contract_json": "{\"chain_id\":\"mainnet\",\"signer_id\":\"trader.alice.near\",\"nonce\":4,\"created_at\":\"2027-01-15T08:00:00.123456789Z\",\"timeout_secs\":3600,\"request\":{\"external\":[{\"receiver_id\":\"intents.near\",\"actions\":[{\"action\":\"function_call\",\"payload\":{\"function_name\":\"ft_withdraw\",\"args\":\"eyJ0b2tlbiI6InVzZHQudGV0aGVyLXRva2VuLm5lYXIiLCJyZWNlaXZlcl9pZCI6ImJvYi5uZWFyIiwiYW1vdW50IjoiNyJ9\",\"deposit\":\"1\",\"gas\":\"80000000000000\",\"gas_weight\":\"0\"}}]}]}}",
+      "agent_half": "2fa33462371e9ee5e7c9f1d8b98da0b2d97ebe30233c212e78ac474b8c8ea7f6fb8cb3c77cd526c1c799cd1202486c28b574d80e625c105a5485594b14cf230f",
+      "tee_half": "7e943d54fe9fc12c1e292671eff94df44e4dd5345216bf0bb3725abd6cb3fc8c1d01f0e1e126f7fab933efa89a300c11dd18abd54071a1ff8cd47cb373ee040b"
+    }
+  ]
+}
