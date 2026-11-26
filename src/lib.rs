@@ -14,16 +14,23 @@ use rand::RngCore;
 use std::str::FromStr;
 
 pub mod access_limits;
+pub mod binding;
 pub mod code_hash;
 pub mod contract_vote;
 pub mod custody_op;
 pub use custody_core;
+pub mod hos;
 pub mod secrets_ref;
 pub mod signer_key;
 /// NEAR's shape for an account id, for every door that takes one — not only
 /// a `secrets_ref`.
 pub use secrets_ref::account_id_is_well_formed;
+/// Golden vectors transcribed from the HoS wallet's own test suite — test-only,
+/// because their whole job is to fail when our mirror of that contract drifts.
+#[cfg(test)]
+mod hos_contract_vectors;
 pub mod wallet_policy;
+pub mod wallet_request_decode;
 
 /// Which signature schemes the server is willing to accept for TEE session auth.
 ///
