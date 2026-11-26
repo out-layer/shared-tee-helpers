@@ -1791,7 +1791,8 @@ fn evaluate_section(
     if let Op::Call { method, .. } = op {
         if method == WALLET_EXTENSION_METHOD {
             return deny(format!(
-                "A call to `{WALLET_EXTENSION_METHOD}` is refused: it acts with full control of                  the account it is aimed at, and no wallet signs one"
+                "A call to `{WALLET_EXTENSION_METHOD}` is refused: it acts with full control of \
+                 the account it is aimed at, and no wallet signs one"
             ));
         }
     }
