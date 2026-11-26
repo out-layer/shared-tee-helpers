@@ -11,6 +11,7 @@ pub mod halves;
 pub mod keys;
 pub mod message;
 pub mod moves;
+pub mod text;
 
 /// What the agent's key signs for a move: this prefix, then the 32 bytes of
 /// the request's hash. The same constant is in the contract.
@@ -26,13 +27,3 @@ pub const REQUEST_DOMAIN: &[u8] = b"NEAR_WALLET_CONTRACT/V1";
 /// How long a request stays valid after `created_at`, in seconds: the
 /// contract's default timeout, which `w_init` of the two-key standard sets.
 pub const TIMEOUT_SECS: u32 = 3600;
-
-/// Strict lowercase hex of exactly `N` bytes.
-pub(crate) fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
-    if s.len() != 2 * N || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return None;
-    }
-    let mut bytes = [0; N];
-    hex::decode_to_slice(s, &mut bytes).ok()?;
-    Some(bytes)
-}

@@ -45,11 +45,7 @@ impl fmt::Display for Refusal {
 }
 
 fn units(field: &'static str, text: &str) -> Result<u128, Refusal> {
-    // digits only: `u128::from_str` also takes a leading `+`
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Refusal::Field(field));
-    }
-    text.parse().map_err(|_| Refusal::Field(field))
+    custody_core::text::decimal(text).ok_or(Refusal::Field(field))
 }
 
 /// The move for `op`. `deposit_address` is the 1Click deposit address of the

@@ -9,7 +9,7 @@ use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
-use crate::{decode_hex, message::RequestMessage, AGENT_PREFIX, TEE_PREFIX};
+use crate::{message::RequestMessage, text, AGENT_PREFIX, TEE_PREFIX};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -77,7 +77,7 @@ impl PublicKeyPair {
     /// `None` for any other text, for two equal keys, and for a key that is
     /// not a point of the curve or is of low order.
     pub fn parse(text: &str) -> Option<Self> {
-        let bytes = decode_hex::<64>(text)?;
+        let bytes = text::hex::<64>(text)?;
         let pair = Self {
             agent: bytes[..32].try_into().ok()?,
             tee: bytes[32..].try_into().ok()?,
@@ -93,7 +93,7 @@ impl PublicKeyPair {
     }
 
     fn verify_over_hash(&self, hash: &[u8; 32], proof: &str) -> bool {
-        let Some(bytes) = decode_hex::<128>(proof) else {
+        let Some(bytes) = text::hex::<128>(proof) else {
             return false;
         };
         let (Ok(agent), Ok(tee)) = (bytes[..64].try_into(), bytes[64..].try_into()) else {
@@ -161,12 +161,12 @@ mod tests {
         assert!(vectors.cases.iter().any(|case| case.valid));
 
         for case in vectors.cases {
-            let bytes = decode_hex::<64>(&case.public_key).expect(&case.name);
+            let bytes = text::hex::<64>(&case.public_key).expect(&case.name);
             let pair = PublicKeyPair {
                 agent: bytes[..32].try_into().unwrap(),
                 tee: bytes[32..].try_into().unwrap(),
             };
-            let hash = decode_hex::<32>(&case.hash).expect(&case.name);
+            let hash = text::hex::<32>(&case.hash).expect(&case.name);
 
             assert_eq!(pair.verify_over_hash(&hash, &case.proof), case.valid, "{}", case.name);
             assert_eq!(

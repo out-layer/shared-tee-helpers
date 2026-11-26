@@ -164,12 +164,8 @@ mod json {
         }
 
         pub fn deserialize<'de, T: FromStr, D: Deserializer<'de>>(d: D) -> Result<T, D::Error> {
-            let text = String::deserialize(d)?;
-            // digits only: `from_str` also takes a leading `+`
-            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(D::Error::custom("not a decimal number"));
-            }
-            text.parse().map_err(|_| D::Error::custom("the number is out of range"))
+            crate::text::decimal(&String::deserialize(d)?)
+                .ok_or_else(|| D::Error::custom("not a decimal number in the field's range"))
         }
     }
 

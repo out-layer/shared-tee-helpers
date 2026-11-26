@@ -68,6 +68,76 @@ impl AgentRequest<'_> {
     }
 }
 
+/// A signed request as one service hands it to another: the parts the agent
+/// sent, with the account it names left to the receiver, which knows the
+/// wallet contract it is serving.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAgentRequest {
+    pub method: String,
+    pub path: String,
+    /// The body, byte for byte as the agent sent it.
+    pub body: String,
+    pub timestamp: u64,
+    /// 16 bytes in lowercase hex.
+    pub nonce: String,
+    /// 64 bytes in lowercase hex.
+    pub signature: String,
+}
+
+/// Why a [`SignedAgentRequest`] is not the agent's.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSigned {
+    /// The field is not the bytes it should be, in lowercase hex.
+    Field(&'static str),
+    /// The signature is not the agent's over this request, or the request's
+    /// timestamp is not the current time.
+    Signature,
+}
+
+#[cfg(feature = "serde")]
+impl std::fmt::Display for NotSigned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field("nonce") => f.write_str("the request's nonce is not 16 bytes in lowercase hex"),
+            Self::Field(field) => write!(f, "the request's {field} is not 64 bytes in lowercase hex"),
+            Self::Signature => f.write_str(
+                "the request is not signed by the agent's key of this wallet contract, or its \
+                 timestamp is not the current time",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl SignedAgentRequest {
+    /// The request, when it was signed by `agent` as `wallet_contract` and its
+    /// timestamp is within [`MAX_CLOCK_DISTANCE_SECS`] of `now`. That the
+    /// nonce is new is the caller's to check.
+    pub fn verified<'a>(
+        &'a self,
+        wallet_contract: &'a str,
+        agent: &[u8; 32],
+        now: u64,
+    ) -> Result<AgentRequest<'a>, NotSigned> {
+        let request = AgentRequest {
+            wallet_contract,
+            method: &self.method,
+            path: &self.path,
+            body: self.body.as_bytes(),
+            timestamp: self.timestamp,
+            nonce: crate::text::hex(&self.nonce).ok_or(NotSigned::Field("nonce"))?,
+        };
+        let signature = crate::text::hex(&self.signature).ok_or(NotSigned::Field("signature"))?;
+        if !request.verify(agent, &signature, now) {
+            return Err(NotSigned::Signature);
+        }
+        Ok(request)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +251,37 @@ mod tests {
         let agent = key().verifying_key().to_bytes();
         assert!(!verify_half(Role::Agent, &agent, &msg, &signature));
         assert!(!verify_half(Role::Tee, &agent, &msg, &signature));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_handed_on_request_is_verified_from_its_text() {
+        let agent = key().verifying_key().to_bytes();
+        let request = || AgentRequest { nonce: [0xab; 16], ..request() };
+        let handed = SignedAgentRequest {
+            method: OPERATION_METHOD.to_string(),
+            path: OPERATION_PATH.to_string(),
+            body: String::from_utf8(request().body.to_vec()).unwrap(),
+            timestamp: NOW,
+            nonce: hex::encode(request().nonce),
+            signature: hex::encode(request().sign(&key())),
+        };
+        assert_eq!(handed.verified("trader.alice.near", &agent, NOW), Ok(request()));
+
+        // as another wallet contract, by another key, at another time
+        assert_eq!(handed.verified("trader.bob.near", &agent, NOW), Err(NotSigned::Signature));
+        assert_eq!(handed.verified("trader.alice.near", &[9; 32], NOW), Err(NotSigned::Signature));
+        assert_eq!(
+            handed.verified("trader.alice.near", &agent, NOW + MAX_CLOCK_DISTANCE_SECS + 1),
+            Err(NotSigned::Signature)
+        );
+
+        // the same bytes in another spelling are not the request
+        let capitals = SignedAgentRequest { nonce: handed.nonce.to_uppercase(), ..handed.clone() };
+        assert_eq!(capitals.verified("trader.alice.near", &agent, NOW), Err(NotSigned::Field("nonce")));
+        let capitals = SignedAgentRequest { signature: handed.signature.to_uppercase(), ..handed.clone() };
+        assert_eq!(capitals.verified("trader.alice.near", &agent, NOW), Err(NotSigned::Field("signature")));
+        let short = SignedAgentRequest { nonce: handed.nonce[2..].to_string(), ..handed };
+        assert_eq!(short.verified("trader.alice.near", &agent, NOW), Err(NotSigned::Field("nonce")));
     }
 }
