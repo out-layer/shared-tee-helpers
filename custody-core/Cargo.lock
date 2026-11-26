@@ -304,6 +304,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "borsh",
+ "custody-core",
  "defuse-wallet",
  "defuse-wallet-two-key",
  "ed25519-dalek 2.2.0",

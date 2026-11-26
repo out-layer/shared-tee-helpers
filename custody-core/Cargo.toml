@@ -16,7 +16,14 @@ hmac = "0.12"
 sha2 = "0.10"
 sha3 = "0.10"
 
+# The JSON form the API carries a built request in.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+
 [dev-dependencies]
+custody-core = { path = ".", features = ["serde"] }
 # The contract these bytes are for, at the commit of its two-key standard:
 # the tests hash and verify against the code that runs on chain.
 defuse-wallet = { git = "https://github.com/out-layer/intents", rev = "26acfe2f8f309ebdf84e8408f0368d58ed36ca2c", features = ["borsh", "digest", "json", "serde"] }

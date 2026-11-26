@@ -16,6 +16,11 @@ pub const AGENT_REQUEST_DOMAIN: &[u8] = b"OUTLAYER_AGENT_REQUEST/V1";
 /// way, in seconds.
 pub const MAX_CLOCK_DISTANCE_SECS: u64 = 120;
 
+/// The request that asks for an operation of the wallet contract: `POST` to
+/// this path, the body the operation in JSON.
+pub const OPERATION_METHOD: &str = "POST";
+pub const OPERATION_PATH: &str = "/wallet/contract/v1/operations";
+
 /// What a signature over a request covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRequest<'a> {
@@ -77,8 +82,8 @@ mod tests {
     fn request() -> AgentRequest<'static> {
         AgentRequest {
             wallet_contract: "trader.alice.near",
-            method: "POST",
-            path: "/wallet/contract/v1/operations",
+            method: OPERATION_METHOD,
+            path: OPERATION_PATH,
             body: br#"{"kind":"transfer","to":"bob.near","amount":"1"}"#,
             timestamp: NOW,
             nonce: [7; 16],

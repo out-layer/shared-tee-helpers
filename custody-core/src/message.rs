@@ -15,6 +15,7 @@ use crate::{REQUEST_DOMAIN, TIMEOUT_SECS};
 
 /// A request to a wallet contract, with the fields a signature covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct RequestMessage {
     /// `mainnet` or `testnet`.
     pub chain_id: String,
@@ -23,30 +24,44 @@ pub struct RequestMessage {
     /// Never accepted twice by the contract within the timeout.
     pub nonce: u32,
     /// Nanoseconds since the Unix epoch. The contract accepts the request
-    /// from this moment for [`TIMEOUT_SECS`].
+    /// from this moment for [`TIMEOUT_SECS`]. In JSON: a decimal string.
+    #[cfg_attr(feature = "serde", serde(with = "json::decimal"))]
     pub created_at_ns: u64,
     pub promise: Promise,
 }
 
 /// One receipt to `receiver_id`, with one action.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(deny_unknown_fields))]
 pub struct Promise {
     pub receiver_id: String,
     pub action: Action,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)
+)]
 pub enum Action {
     FunctionCall {
         function_name: String,
+        /// In JSON: base64.
+        #[cfg_attr(feature = "serde", serde(with = "json::base64"))]
         args: Vec<u8>,
-        /// yoctoNEAR.
+        /// yoctoNEAR. In JSON: a decimal string.
+        #[cfg_attr(feature = "serde", serde(with = "json::decimal"))]
         deposit: u128,
-        /// The exact gas of the call.
+        /// The exact gas of the call. In JSON: a decimal string.
+        #[cfg_attr(feature = "serde", serde(with = "json::decimal"))]
         gas: u64,
     },
-    /// yoctoNEAR.
-    Transfer { amount: u128 },
+    Transfer {
+        /// yoctoNEAR. In JSON: a decimal string.
+        #[cfg_attr(feature = "serde", serde(with = "json::decimal"))]
+        amount: u128,
+    },
 }
 
 impl RequestMessage {
@@ -134,6 +149,44 @@ fn rfc3339(ns: u64) -> String {
     )
 }
 
+/// How this crate's own JSON form of a message writes numbers and bytes. The
+/// form carries a built request between the services and the agent; it is not
+/// the contract's ([`RequestMessage::to_json`]).
+#[cfg(feature = "serde")]
+mod json {
+    pub mod decimal {
+        use std::{fmt::Display, str::FromStr};
+
+        use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<T: Display, S: Serializer>(value: &T, s: S) -> Result<S::Ok, S::Error> {
+            s.collect_str(value)
+        }
+
+        pub fn deserialize<'de, T: FromStr, D: Deserializer<'de>>(d: D) -> Result<T, D::Error> {
+            let text = String::deserialize(d)?;
+            // digits only: `from_str` also takes a leading `+`
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(D::Error::custom("not a decimal number"));
+            }
+            text.parse().map_err(|_| D::Error::custom("the number is out of range"))
+        }
+    }
+
+    pub mod base64 {
+        use ::base64::{engine::general_purpose::STANDARD, Engine};
+        use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&STANDARD.encode(bytes))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+            STANDARD.decode(String::deserialize(d)?).map_err(|_| D::Error::custom("not base64"))
+        }
+    }
+}
+
 impl BorshSerialize for RequestMessage {
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         false.serialize(w)?; // pay_for_gas
@@ -180,6 +233,41 @@ mod tests {
             (4_107_542_400_000_000_000, "2100-03-01T00:00:00.000000000Z"),
         ] {
             assert_eq!(rfc3339(ns), text);
+        }
+    }
+
+    #[test]
+    fn its_own_json_form_round_trips() {
+        let msg = RequestMessage {
+            chain_id: "mainnet".to_string(),
+            signer_id: "trader.alice.near".to_string(),
+            nonce: 3,
+            created_at_ns: u64::MAX,
+            promise: Promise {
+                receiver_id: "app.near".to_string(),
+                action: Action::FunctionCall {
+                    function_name: "do".to_string(),
+                    args: vec![0, 255],
+                    deposit: u128::MAX,
+                    gas: 5,
+                },
+            },
+        };
+        let text = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            text,
+            r#"{"chain_id":"mainnet","signer_id":"trader.alice.near","nonce":3,"created_at_ns":"18446744073709551615","promise":{"receiver_id":"app.near","action":{"action":"function_call","function_name":"do","args":"AP8=","deposit":"340282366920938463463374607431768211455","gas":"5"}}}"#
+        );
+        assert_eq!(serde_json::from_str::<RequestMessage>(&text).unwrap(), msg);
+
+        for refused in [
+            text.replace(r#""gas":"5""#, r#""gas":"+5""#),
+            text.replace(r#""gas":"5""#, r#""gas":5"#),
+            text.replace(r#""nonce":3"#, r#""nonce":3,"pay_for_gas":true"#),
+            text.replace(r#""receiver_id""#, r#""refund_to":"x.near","receiver_id""#),
+            text.replace("function_call", "deterministic_state_init"),
+        ] {
+            assert!(serde_json::from_str::<RequestMessage>(&refused).is_err(), "{refused}");
         }
     }
 
