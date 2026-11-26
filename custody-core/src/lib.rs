@@ -24,6 +24,24 @@ pub const TEE_PREFIX: &[u8] = b"NEAR_WALLET_TWO_KEY/V1/TEE";
 /// The wallet contract's prefix of a request's canonical hash.
 pub const REQUEST_DOMAIN: &[u8] = b"NEAR_WALLET_CONTRACT/V1";
 
-/// How long a request stays valid after `created_at`, in seconds: the
-/// contract's default timeout, which `w_init` of the two-key standard sets.
-pub const TIMEOUT_SECS: u32 = 3600;
+/// How long a request stays valid after `created_at`, in seconds. Every
+/// request carries it, and the wallet contract accepts a request for the
+/// shorter of this and its own timeout (an hour). Ten minutes: a half the
+/// enclave gave out cannot be taken back, so a freeze or a change of policy
+/// leaves a prepared request usable for no longer than this; it is also how
+/// long a 1Click quote waits for its deposit.
+pub const TIMEOUT_SECS: u32 = 600;
+
+/// The codes the enclave attaches to a refusal that is not the policy's, so
+/// the API in front of it can answer each as what it is.
+pub mod refusal {
+    /// The owner froze the wallet.
+    pub const WALLET_FROZEN: &str = "wallet_frozen";
+    /// A signature is not what it has to be: the agent's over its request, or
+    /// the two halves over the wallet contract's request.
+    pub const INVALID_SIGNATURE: &str = "invalid_signature";
+    /// The account is not served as this wallet's wallet contract: it runs
+    /// no approved build, has an extension, has signatures switched off, or
+    /// its pair does not hold this wallet's key.
+    pub const WALLET_CONTRACT_REFUSED: &str = "wallet_contract_refused";
+}
