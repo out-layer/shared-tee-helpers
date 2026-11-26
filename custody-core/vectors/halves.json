@@ -1,0 +1,206 @@
+{
+  "agent_prefix": "NEAR_WALLET_TWO_KEY/V1/AGENT",
+  "tee_prefix": "NEAR_WALLET_TWO_KEY/V1/TEE",
+  "cases": [
+    {
+      "name": "both signatures",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": true
+    },
+    {
+      "name": "the agent's signature only",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a02",
+      "valid": false
+    },
+    {
+      "name": "the TEE's signature only",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "1648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "the agent's signature twice",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a027b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a02",
+      "valid": false
+    },
+    {
+      "name": "the TEE's signature twice",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "1648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a7564001648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "the agent's signature and zeros",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a0200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "valid": false
+    },
+    {
+      "name": "zeros and the TEE's signature",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "the two signatures in the other order",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "1648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a7564007b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a02",
+      "valid": false
+    },
+    {
+      "name": "each key signed under the other's prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "9749bc738126f2c66cf8013b2668b89fdff24cdd2e3fbffafde342201fb9afb845a52ddecffc44bcbb53ada3584e8b3281f12b867d4ba194fb564918a5032c0ad50fc8a45d0c366d89fcf4032671ee985e3fb892d9dc8d6ddabb94d6cd612a7f319adc33fc94acdcdbeed0522e09f27b3f7b5946e7608199e701c6a03164be05",
+      "valid": false
+    },
+    {
+      "name": "both signed the hash with no prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "8acd3ce15cbdc8bf331012c8a53687eb6affef327271b686cbca1ff8912023afc6ac468e593488aaebf34f937e4cf3ca77bfd6d36a02de70aedc86cbad384e0a013ac80d5d38a8a6c8db0e3188d9ede5df0f683f6ae6c13f94f13ab5b5c741b84e339957b6ab66c0eab33c974ae08c5bdbd5bc72bc82e607af5b05554c2fb402",
+      "valid": false
+    },
+    {
+      "name": "the agent signed the hash with no prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "8acd3ce15cbdc8bf331012c8a53687eb6affef327271b686cbca1ff8912023afc6ac468e593488aaebf34f937e4cf3ca77bfd6d36a02de70aedc86cbad384e0a1648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "the TEE signed the hash with no prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a02013ac80d5d38a8a6c8db0e3188d9ede5df0f683f6ae6c13f94f13ab5b5c741b84e339957b6ab66c0eab33c974ae08c5bdbd5bc72bc82e607af5b05554c2fb402",
+      "valid": false
+    },
+    {
+      "name": "a proof of another hash",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "769970b287a9aa79289ce652c8c36f24055119359e383af9cc7bbf350c103a62",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "uppercase hex",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7B74E1BD902ABE1D35010633DC23A2E6698B341CB119B8465FD9F6B1E1C668C7B9481BC69E8ED69CF362D8D8028EFC26ED409A42EEF89229F894ED7F68812A021648678D87E310DDDECFA48230C99BFFE2A305EEB09A9600B692FF1F5ED9F0A167250C38EB15079609D85E646B779BA4CAD894C6CD6E986A9A8DC5434A756400",
+      "valid": false
+    },
+    {
+      "name": "one character of uppercase hex",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902Abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "a 0x prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "0x7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "a trailing byte",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a75640000",
+      "valid": false
+    },
+    {
+      "name": "a trailing space",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400 ",
+      "valid": false
+    },
+    {
+      "name": "a separator between the signatures",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a02,1648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "one character short",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a75640",
+      "valid": false
+    },
+    {
+      "name": "empty",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "",
+      "valid": false
+    },
+    {
+      "name": "the keys in the other order",
+      "public_key": "411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83ffc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315",
+      "public_key_valid": true,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a021648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "equal keys, each half valid under its prefix",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a14358500315",
+      "public_key_valid": false,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a029749bc738126f2c66cf8013b2668b89fdff24cdd2e3fbffafde342201fb9afb845a52ddecffc44bcbb53ada3584e8b3281f12b867d4ba194fb564918a5032c0a",
+      "valid": false
+    },
+    {
+      "name": "an agent key of low order with the forged signature",
+      "public_key": "0100000000000000000000000000000000000000000000000000000000000000411e0abe28516adb9b6d20b36c4830c6ec1c534ab8a6453ae3c0cf7823e2e83f",
+      "public_key_valid": false,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001648678d87e310dddecfa48230c99bffe2a305eeb09a9600b692ff1f5ed9f0a167250c38eb15079609d85e646b779ba4cad894c6cd6e986a9a8dc5434a756400",
+      "valid": false
+    },
+    {
+      "name": "a TEE key of low order with the forged signature",
+      "public_key": "fc49cb72bb807aed4f2a7c15e9a43de767fbd0f4ed4b8fcb3a96a143585003150100000000000000000000000000000000000000000000000000000000000000",
+      "public_key_valid": false,
+      "hash": "0f19dcb233bd3febfbdd102793eec7bf8ce4180451ea4e67c650c53af9f78fa4",
+      "proof": "7b74e1bd902abe1d35010633dc23a2e6698b341cb119b8465fd9f6b1e1c668c7b9481bc69e8ed69cf362d8d8028efc26ed409a42eef89229f894ed7f68812a0201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "valid": false
+    }
+  ]
+}
