@@ -5,8 +5,12 @@
 //! keystore, the coordinator, the CLI and the owner's recovery tool all build
 //! on this crate, so there is one implementation of each byte format.
 
+pub mod admit;
+pub mod agent_request;
 pub mod halves;
+pub mod keys;
 pub mod message;
+pub mod moves;
 
 /// What the agent's key signs for a move: this prefix, then the 32 bytes of
 /// the request's hash. The same constant is in the contract.
