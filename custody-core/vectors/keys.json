@@ -1,0 +1,17 @@
+{
+  "owner": "alice.near",
+  "wallet_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "tee": {
+    "owner_master": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+    "derivation": "wallet-contract:7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "public_key": "526ac10196972c26ba47a2523b98e0d8a4101332847abad7ea1575b6544a333c"
+  },
+  "agent": {
+    "nep413_recipient": "outlayer-agent-key",
+    "nep413_nonce": "6f75746c617965722f6167656e742d6b65792f76312f6e6f6e63650000000000",
+    "nep413_message": "This signature is the key of your OutLayer agent. Sign it only on app.outlayer.ai, when you set up or recover an agent.\nOwner: alice.near\nWallet: 7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "signature": "51515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151515151",
+    "seed": "54777414f0d4f8e56545cae26e90cb9b79e5ed40b1d89f8f94cd7fd48fcdf092",
+    "public_key": "91108c4cfecd4d35ac44be724ba4efcbfd18d9d590890fdc8cceaa747afc7338"
+  }
+}

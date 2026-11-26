@@ -6,6 +6,7 @@
 use custody_core::{
     agent_request::{AgentRequest, OPERATION_METHOD, OPERATION_PATH},
     halves::{proof, sign_half, PublicKeyPair, Role},
+    keys::{agent_key, agent_key_message, tee_key, tee_key_seed, AGENT_KEY_NONCE, AGENT_KEY_RECIPIENT},
     message::RequestMessage,
     moves::{build, Context, Move},
 };
@@ -140,6 +141,33 @@ fn agent_requests() {
             "agent_seed": hex::encode(AGENT_SEED),
             "agent_public_key": hex::encode(agent.verifying_key().to_bytes()),
             "cases": cases,
+        }),
+    );
+}
+
+#[test]
+fn keys() {
+    let (owner, wallet_id) = ("alice.near", "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+    let owner_master = [0x4d; 32];
+    let signature = [0x51; 64];
+    held(
+        "keys.json",
+        &json!({
+            "owner": owner,
+            "wallet_id": wallet_id,
+            "tee": {
+                "owner_master": hex::encode(owner_master),
+                "derivation": tee_key_seed(wallet_id),
+                "public_key": hex::encode(tee_key(&owner_master, wallet_id).verifying_key().to_bytes()),
+            },
+            "agent": {
+                "nep413_recipient": AGENT_KEY_RECIPIENT,
+                "nep413_nonce": hex::encode(AGENT_KEY_NONCE),
+                "nep413_message": agent_key_message(owner, wallet_id),
+                "signature": hex::encode(signature),
+                "seed": hex::encode(agent_key(&signature, owner, wallet_id).to_bytes()),
+                "public_key": hex::encode(agent_key(&signature, owner, wallet_id).verifying_key().to_bytes()),
+            },
         }),
     );
 }
