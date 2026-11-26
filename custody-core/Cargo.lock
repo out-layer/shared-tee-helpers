@@ -303,7 +303,6 @@ name = "custody-core"
 version = "0.1.0"
 dependencies = [
  "borsh",
- "bs58",
  "defuse-wallet",
  "defuse-wallet-two-key",
  "ed25519-dalek 2.2.0",

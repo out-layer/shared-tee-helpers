@@ -9,7 +9,6 @@ description = "Agent On-chain custody: the bytes that are signed, and the rules 
 # clock or draws randomness.
 [dependencies]
 borsh = "1.5"
-bs58 = "0.5"
 ed25519-dalek = { version = "2.1", default-features = false }
 hex = "0.4"
 hmac = "0.12"

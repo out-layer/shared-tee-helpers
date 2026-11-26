@@ -16,6 +16,8 @@ use std::str::FromStr;
 pub mod access_limits;
 pub mod code_hash;
 pub mod contract_vote;
+pub mod custody_op;
+pub use custody_core;
 pub mod secrets_ref;
 pub mod signer_key;
 /// NEAR's shape for an account id, for every door that takes one — not only
