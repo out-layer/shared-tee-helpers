@@ -251,6 +251,7 @@ dependencies = [
 name = "custody-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "borsh",
  "ed25519-dalek",
  "hex",

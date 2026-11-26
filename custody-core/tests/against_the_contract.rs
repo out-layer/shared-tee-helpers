@@ -168,3 +168,43 @@ fn the_contract_accepts_the_proof_made_here_and_no_part_of_it() {
         assert!(!WalletTwoKey::verify_request_msg(&theirs_pair, &upstream(&other), &both));
     }
 }
+
+/// The JSON a relayer sends is the same message to the contract: its own
+/// deserializer reads back the value that was signed.
+#[test]
+fn the_json_form_is_read_by_the_contract_as_the_same_message() {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        msg: defuse_wallet::RequestMessage,
+        proof: String,
+    }
+
+    let mut messages = messages();
+    messages.push(RequestMessage {
+        chain_id: "main\"net\\\n".to_string(),
+        signer_id: "trader.alice.near".to_string(),
+        nonce: 1,
+        created_at_ns: 1_800_000_000_123_456_789,
+        promise: Promise {
+            receiver_id: "app.near".to_string(),
+            action: Action::FunctionCall {
+                function_name: "quote\"back\\slash\ttab".to_string(),
+                args: vec![0, 1, 2, 255],
+                deposit: 0,
+                gas: 1,
+            },
+        },
+    });
+
+    for msg in messages {
+        let theirs = upstream(&msg);
+        let read: defuse_wallet::RequestMessage = serde_json::from_str(&msg.to_json())
+            .unwrap_or_else(|e| panic!("{e}: {}", msg.to_json()));
+        assert_eq!(read, theirs);
+        assert_eq!(read.hash(), msg.hash());
+
+        let args: Args = serde_json::from_slice(&msg.execute_signed_args("ab\"cd")).unwrap();
+        assert_eq!(args.msg, theirs);
+        assert_eq!(args.proof, "ab\"cd");
+    }
+}

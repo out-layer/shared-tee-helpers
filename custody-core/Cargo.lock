@@ -302,6 +302,7 @@ dependencies = [
 name = "custody-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "borsh",
  "defuse-wallet",
  "defuse-wallet-two-key",
@@ -413,6 +414,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "k256",
  "near-sdk",
+ "serde_with",
  "thiserror",
 ]
 
@@ -424,6 +426,7 @@ dependencies = [
  "digest 0.11.3",
  "impl-tools 0.13.0",
  "near-sdk-env",
+ "sha2 0.11.2",
  "sha3 0.11.0",
 ]
 
@@ -441,12 +444,36 @@ version = "0.1.0"
 source = "git+https://github.com/out-layer/intents?rev=26acfe2f8f309ebdf84e8408f0368d58ed36ca2c#26acfe2f8f309ebdf84e8408f0368d58ed36ca2c"
 dependencies = [
  "borsh",
+ "cfg_eval",
  "derive_more",
  "near-account-id",
  "near-gas",
  "near-global-contracts",
  "near-token",
+ "serde",
+ "serde_json",
+ "serde_with",
 ]
+
+[[package]]
+name = "defuse-nep413"
+version = "0.1.0"
+source = "git+https://github.com/out-layer/intents?rev=26acfe2f8f309ebdf84e8408f0368d58ed36ca2c#26acfe2f8f309ebdf84e8408f0368d58ed36ca2c"
+dependencies = [
+ "borsh",
+ "cfg_eval",
+ "defuse-crypto",
+ "defuse-digest",
+ "defuse-nep461",
+ "digest-io",
+ "serde",
+ "serde_with",
+]
+
+[[package]]
+name = "defuse-nep461"
+version = "0.1.0"
+source = "git+https://github.com/out-layer/intents?rev=26acfe2f8f309ebdf84e8408f0368d58ed36ca2c#26acfe2f8f309ebdf84e8408f0368d58ed36ca2c"
 
 [[package]]
 name = "defuse-nep641"
@@ -457,9 +484,13 @@ dependencies = [
  "defuse-borsh-utils",
  "defuse-crypto",
  "defuse-digest",
+ "defuse-nep413",
  "defuse-time",
  "digest-io",
  "near-account-id",
+ "serde",
+ "serde_json",
+ "serde_with",
 ]
 
 [[package]]
@@ -470,6 +501,8 @@ dependencies = [
  "borsh",
  "defuse-borsh-utils",
  "near-sdk",
+ "serde",
+ "serde_with",
  "thiserror",
  "time",
 ]
@@ -480,6 +513,7 @@ version = "0.1.0"
 source = "git+https://github.com/out-layer/intents?rev=26acfe2f8f309ebdf84e8408f0368d58ed36ca2c#26acfe2f8f309ebdf84e8408f0368d58ed36ca2c"
 dependencies = [
  "borsh",
+ "cfg_eval",
  "defuse-bitmap",
  "defuse-borsh-utils",
  "defuse-digest",
@@ -488,6 +522,9 @@ dependencies = [
  "defuse-time",
  "digest-io",
  "near-account-id",
+ "serde",
+ "serde_json",
+ "serde_with",
  "thiserror",
 ]
 

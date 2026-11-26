@@ -7,6 +7,7 @@
 //! encoder writes those as empty or false. There is no decoder: a request is
 //! built here from an operation, never read from a caller.
 
+use base64::Engine;
 use borsh::BorshSerialize;
 use sha3::{Digest, Sha3_256};
 
@@ -63,6 +64,76 @@ impl RequestMessage {
     }
 }
 
+impl RequestMessage {
+    /// The arguments of the contract's `w_execute_signed(msg, proof)`, as
+    /// JSON.
+    pub fn execute_signed_args(&self, proof: &str) -> Vec<u8> {
+        format!(r#"{{"msg":{},"proof":{}}}"#, self.to_json(), json_string(proof)).into_bytes()
+    }
+
+    /// The contract's JSON form of this message.
+    pub fn to_json(&self) -> String {
+        let action = match &self.promise.action {
+            Action::FunctionCall { function_name, args, deposit, gas } => format!(
+                r#"{{"action":"function_call","payload":{{"function_name":{},"args":"{}","deposit":"{deposit}","gas":"{gas}","gas_weight":"0"}}}}"#,
+                json_string(function_name),
+                base64::engine::general_purpose::STANDARD.encode(args),
+            ),
+            Action::Transfer { amount } => {
+                format!(r#"{{"action":"transfer","payload":{{"amount":"{amount}"}}}}"#)
+            }
+        };
+        format!(
+            r#"{{"chain_id":{},"signer_id":{},"nonce":{},"created_at":"{}","timeout_secs":{TIMEOUT_SECS},"request":{{"external":[{{"receiver_id":{},"actions":[{action}]}}]}}}}"#,
+            json_string(&self.chain_id),
+            json_string(&self.signer_id),
+            self.nonce,
+            rfc3339(self.created_at_ns),
+            json_string(&self.promise.receiver_id),
+        )
+    }
+}
+
+/// `text` as a JSON string.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!(r"\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Nanoseconds since the Unix epoch as an RFC 3339 time in UTC, with nine
+/// digits of the second's fraction.
+fn rfc3339(ns: u64) -> String {
+    let (secs, nanos) = (ns / 1_000_000_000, ns % 1_000_000_000);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+
+    // days since the epoch to a civil date (Howard Hinnant's `civil_from_days`)
+    let z = days + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{nanos:09}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60,
+    )
+}
+
 impl BorshSerialize for RequestMessage {
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         false.serialize(w)?; // pay_for_gas
@@ -90,5 +161,32 @@ impl BorshSerialize for RequestMessage {
                 amount.serialize(w)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times() {
+        for (ns, text) in [
+            (0, "1970-01-01T00:00:00.000000000Z"),
+            (1, "1970-01-01T00:00:00.000000001Z"),
+            (951_782_399_999_999_999, "2000-02-28T23:59:59.999999999Z"),
+            (951_782_400_000_000_000, "2000-02-29T00:00:00.000000000Z"),
+            (1_800_000_000_123_000_000, "2027-01-15T08:00:00.123000000Z"),
+            (4_107_542_399_000_000_000, "2100-02-28T23:59:59.000000000Z"),
+            (4_107_542_400_000_000_000, "2100-03-01T00:00:00.000000000Z"),
+        ] {
+            assert_eq!(rfc3339(ns), text);
+        }
+    }
+
+    #[test]
+    fn strings() {
+        assert_eq!(json_string("plain"), r#""plain""#);
+        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_string("a\nb\u{1}"), r#""a\u000ab\u0001""#);
     }
 }
