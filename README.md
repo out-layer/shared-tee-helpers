@@ -74,3 +74,26 @@ tee-auth = { path = "../tee-auth" }
 ```
 
 Consumers: `coordinator`, `keystore-worker`
+
+## custody-core
+
+`custody-core/` is a second crate in this repository: the bytes that are
+signed for a wallet contract of the two-key standard (Agent On-chain custody),
+and the rules about it that are pure. It does no I/O: no HTTP, no RPC, no
+clock, no randomness. The keystore, the coordinator and the owner's recovery
+tool build on it, so each byte format has one implementation.
+
+| Module | What it holds |
+|---|---|
+| `message` | the wallet contract's request, its Borsh encoding, its hash and its JSON forms |
+| `moves` | the request for each move a wallet contract makes |
+| `halves` | the agent's and the TEE's half of a request, the pair of public keys, the proof |
+| `agent_request` | an HTTPS request signed by the agent's key |
+| `keys` | the TEE's key of a wallet from the owner's master; the agent's key from the owner's signature |
+| `admit` | what an account has to show to be served as a wallet contract |
+| `text` | the one spelling of bytes (lowercase hex) and of a number (decimal digits) |
+
+`custody-core/vectors/` are the test vectors other implementations check
+against (`halves.json` is the contract's own file, byte for byte);
+`tests/against_the_contract.rs` hashes and verifies against the contract's
+code. The model: `docs/ON_CHAIN_CUSTODY.md` in `out-layer/near-offshore`.
