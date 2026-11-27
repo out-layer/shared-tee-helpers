@@ -63,6 +63,11 @@ impl fmt::Display for Fault {
 /// Admit an account as the wallet contract of the wallet whose TEE key is
 /// `tee`: it runs the build `code_hash`, has no extension, accepts
 /// signatures, and holds a pair whose TEE key is `tee`.
+///
+/// The second line behind the request's shape (`message`): the TEE signs
+/// nothing that adds an extension, and a wallet contract that has one anyway
+/// is not served, since the extension can move its funds past both
+/// signatures. Every one of these four checks stays.
 pub fn admit(code_hash: &[u8; 32], tee: &[u8; 32], observed: &Observed) -> Result<Admitted, Fault> {
     if &observed.code_hash != code_hash {
         return Err(Fault::CodeHash);

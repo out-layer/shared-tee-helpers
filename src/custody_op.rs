@@ -5,6 +5,14 @@
 //! the wallet contract then does for it, or that it does nothing. One match,
 //! one arm per kind: a new kind of operation does not compile until it is
 //! placed here.
+//!
+//! What a wallet contract does is a [`Move`], and nothing else: a move is one
+//! promise to another account with one action (`custody_core::message`). A
+//! kind refused here is refused for good: none is ever served by building a
+//! wallet operation (an extension, the signature mode) or a request of another
+//! shape, since the TEE's half over such a request would let an extension move
+//! the contract's funds with no signature and no policy. Such a kind is done
+//! from the agent's working account.
 
 use std::fmt;
 

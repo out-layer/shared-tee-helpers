@@ -161,6 +161,9 @@ pub fn build(mv: &Move, ctx: &Context) -> Result<RequestMessage, Refusal> {
     };
 
     let signer_id = account_id(&ctx.wallet_contract)?;
+    // A promise to the wallet contract itself would call its own methods,
+    // `w_execute_signed` and `w_execute_extension` among them, under the two
+    // signatures: refused for every move, before any is signed.
     if receiver_id == signer_id {
         return Err(Refusal::ToItself);
     }
@@ -338,5 +341,47 @@ mod tests {
             amount: 1,
         };
         assert_eq!(build(&mv, &ctx), Err(Refusal::ToItself));
+    }
+
+    /// Every move builds the one shape the TEE signs: no wallet operation, one
+    /// promise to another account, one action that is a function call or a
+    /// transfer. Read from the bytes the halves are over, not from the types.
+    /// The match lists every move with no wildcard: a new move does not
+    /// compile until it is added here.
+    #[test]
+    fn every_request_has_the_one_shape() {
+        let every_move = |mv: &Move| match mv {
+            Move::NearTransfer { .. }
+            | Move::Call { .. }
+            | Move::IntentsTransfer { .. }
+            | Move::IntentsWithdraw { .. } => (),
+        };
+        let moves = [
+            Move::NearTransfer { to: "bob.near".to_string(), amount: 5 },
+            Move::Call { to: "app.near".to_string(), method: "go".to_string(), args: b"{}".to_vec(), gas: 30_000_000_000_000, deposit: 1 },
+            Move::IntentsTransfer { to: "bob.near".to_string(), token_id: "nep141:wrap.near".to_string(), amount: 1 },
+            Move::IntentsWithdraw { token: "wrap.near".to_string(), to: "bob.near".to_string(), amount: 1 },
+        ];
+        let ctx = ctx();
+        for mv in &moves {
+            every_move(mv);
+            let msg = build(mv, &ctx).unwrap();
+            let b = msg.to_borsh();
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let str_end = |at: usize| at + 4 + u32_at(at) as usize;
+            // pay_for_gas, chain_id, signer_id, nonce, created_at, timeout
+            assert_eq!(b[0], 0, "{mv:?}: pay_for_gas");
+            let mut at = str_end(str_end(1));
+            assert_eq!(&b[at..at + 4], &ctx.nonce.to_le_bytes());
+            at += 4 + 8 + 4;
+            assert_eq!(u32_at(at), 0, "{mv:?}: a wallet operation");
+            assert_eq!(u32_at(at + 4), 1, "{mv:?}: more than one promise");
+            let receiver_end = str_end(at + 8);
+            let receiver = std::str::from_utf8(&b[at + 12..receiver_end]).unwrap();
+            assert_ne!(receiver, ctx.wallet_contract, "{mv:?}: a promise to itself");
+            assert_eq!(b[receiver_end], 0, "{mv:?}: refund_to");
+            assert_eq!(u32_at(receiver_end + 1), 1, "{mv:?}: more than one action");
+            assert!(matches!(b[receiver_end + 5], 2 | 3), "{mv:?}: action tag {}", b[receiver_end + 5]);
+        }
     }
 }

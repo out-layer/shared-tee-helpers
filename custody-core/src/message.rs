@@ -6,6 +6,17 @@
 //! mode), no state-init action, no `refund_to` and no `pay_for_gas`; the
 //! encoder writes those as empty or false. There is no decoder: a request is
 //! built here from an operation, never read from a caller.
+//!
+//! This is the guarantee on-chain custody rests on. The TEE's half is made
+//! only over a `RequestMessage`, so a request with a wallet operation
+//! (`AddExtension`, `RemoveExtension`, `SetSignatureMode`), a second promise,
+//! a promise to the wallet contract itself or an action other than a function
+//! call or a transfer cannot be signed: an extension added that way could move
+//! everything the contract holds with no signature and no policy. These types
+//! are not widened, and no field is added that carries any of those, whatever
+//! the feature asking for it; a feature that needs one is done from the
+//! agent's working account. `tests::every_request_has_the_one_shape` in
+//! `moves.rs` holds the bytes to it.
 
 use base64::Engine;
 use borsh::BorshSerialize;
@@ -183,6 +194,11 @@ mod json {
     }
 }
 
+/// The contract's Borsh layout, with the parts this product never signs
+/// written as constants: no wallet operation, one promise, no `refund_to`, one
+/// action, and that action's tag 2 (function call) or 3 (transfer), never the
+/// contract's state-init action (11). See the module's doc: these constants
+/// are the guarantee, not a simplification.
 impl BorshSerialize for RequestMessage {
     fn serialize<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         false.serialize(w)?; // pay_for_gas
