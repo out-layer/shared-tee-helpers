@@ -61,6 +61,24 @@ pub fn state_init_bytes(code_hash: &[u8; 32], pair: &PublicKeyPair) -> Vec<u8> {
     out
 }
 
+/// What the owner signs (NEP-413, by a full-access key of their account) to
+/// name a `0s` account as their agent's wallet contract.
+///
+/// The owner's account or a sub-account of it can only have been made by the
+/// owner. A `0s` account can be made by anyone, with any agent key beside the
+/// wallet's public TEE key, so a setup token in other hands could name one
+/// whose agent key its holder knows. This signature is what ties the account
+/// and its agent key to the owner.
+pub fn account_proof_message(owner: &str, wallet_id: &str, account_id: &str, agent_public_key_hex: &str) -> String {
+    format!(
+        "This wallet contract is my agent's. Sign it only on app.outlayer.ai, when you set up an agent.\n\
+         Owner: {owner}\nWallet: {wallet_id}\nAccount: {account_id}\nAgent key: {agent_public_key_hex}"
+    )
+}
+
+/// The NEP-413 recipient of [`account_proof_message`].
+pub const ACCOUNT_PROOF_RECIPIENT: &str = "outlayer-agent-account";
+
 /// The `0s` account of a fresh wallet contract of `pair` on the build
 /// `code_hash`.
 pub fn deterministic_account(code_hash: &[u8; 32], pair: &PublicKeyPair) -> String {
@@ -124,6 +142,17 @@ mod tests {
             let contracts = borsh::to_vec(&defuse_wallet::State::new(key)).unwrap();
             assert_eq!(contracts, state_bytes(&pair), "{}", case.name);
         }
+    }
+
+    #[test]
+    fn the_account_proof_names_every_part() {
+        let m = account_proof_message("alice.near", "w-1", "0sabc", "ab12");
+        assert_eq!(
+            m,
+            "This wallet contract is my agent's. Sign it only on app.outlayer.ai, when you set up an agent.\n\
+             Owner: alice.near\nWallet: w-1\nAccount: 0sabc\nAgent key: ab12"
+        );
+        assert_ne!(ACCOUNT_PROOF_RECIPIENT, crate::keys::AGENT_KEY_RECIPIENT);
     }
 
     /// Every field the address commits to changes it: another pair, another
