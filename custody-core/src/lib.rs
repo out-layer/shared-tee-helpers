@@ -7,6 +7,7 @@
 
 pub mod admit;
 pub mod agent_request;
+pub mod deterministic;
 pub mod halves;
 pub mod keys;
 pub mod message;
